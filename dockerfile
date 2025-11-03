@@ -1,14 +1,20 @@
-# Use Python 3.12 so audioop exists
+# Use a stable Python version that includes audioop
 FROM python:3.12-slim
 
-# Set working directory
+# Set working directory inside the container
 WORKDIR /app
 
-# Copy all files
-COPY . .
+# Copy only requirements first (for caching)
+COPY requirements.txt .
 
 # Install dependencies
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Start both the Flask web server and the Discord bot
-CMD ["bash", "-c", "python3 web_server.py & python3 main.py"]
+# Copy your bot files
+COPY . .
+
+# Expose port for Flask web server
+EXPOSE 8080
+
+# Run both Flask web server and Discord bot
+CMD ["sh", "-c", "python3 web_server.py & python3 main.py"]
