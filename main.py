@@ -104,7 +104,7 @@ async def on_ready():
     print("💾 JSON storage ready")
 
 # ------------------------- ECONOMY COMMANDS -------------------------
-@bot.command(aliases=["vebalance", "balance"])
+@bot.command(aliases=["vebalance"])
 async def balance(ctx, member: discord.Member=None):
     member = member or ctx.author
     user = await get_user(member.id)
@@ -741,4 +741,5 @@ async def veabout(ctx):
 
 # ------------------------- RUN BOT -------------------------
 keep_alive()
+
 bot.run(TOKEN)
