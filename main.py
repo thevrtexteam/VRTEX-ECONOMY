@@ -226,7 +226,7 @@ async def vote(ctx):
     await ctx.send(f"✅ Thanks for voting! You received **{amount}$**!\nVote here: {TOPGG_LINK}")
 
 # ------------------------- VRTEX+ MEMBERSHIP MANAGEMENT -------------------------
-@bot.command(aliases=["addplus"])
+@bot.command()
 async def addplus(ctx, member: discord.Member):
     if ctx.author.id not in TEAM_IDS and ctx.author.id != OWNER_ID:
         await ctx.send("❌ Only team members or owner can give VRTEX+ membership.")
@@ -743,6 +743,7 @@ async def veabout(ctx):
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
 
