@@ -104,7 +104,7 @@ async def on_ready():
     print("💾 JSON storage ready")
 
 # ------------------------- ECONOMY COMMANDS -------------------------
-@bot.command(aliases=["vebalance"])
+@bot.command()
 async def balance(ctx, member: discord.Member=None):
     member = member or ctx.author
     user = await get_user(member.id)
@@ -114,7 +114,7 @@ async def balance(ctx, member: discord.Member=None):
     embed.add_field(name="Membership", value="VRTEX+" if user.get("membership") else "Normal", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(aliases=["vedeposit"])
+@bot.command()
 async def deposit(ctx, amount: int):
     user = await get_user(ctx.author.id)
     if amount <= 0 or amount > user["wallet"]:
@@ -125,7 +125,7 @@ async def deposit(ctx, amount: int):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ Deposited {amount}$ into your bank!")
 
-@bot.command(aliases=["vewithdraw"])
+@bot.command()
 async def withdraw(ctx, amount: int):
     user = await get_user(ctx.author.id)
     if amount <= 0 or amount > user["bank"]:
@@ -136,7 +136,7 @@ async def withdraw(ctx, amount: int):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ Withdrawn {amount}$ to your wallet!")
 
-@bot.command(aliases=["vetransfer"])
+@bot.command()
 async def transfer(ctx, member: discord.Member, amount: int):
     if member.id == ctx.author.id:
         await ctx.send("❌ You cannot transfer to yourself!")
@@ -152,7 +152,7 @@ async def transfer(ctx, member: discord.Member, amount: int):
     await update_user(member.id, receiver)
     await ctx.send(f"✅ Transferred {amount}$ to {member.mention}!")
 
-@bot.command(aliases=["veleaderboard"])
+@bot.command()
 async def leaderboard(ctx):
     users = load_json("users")
     top = sorted(users.items(), key=lambda x: x[1]["wallet"] + x[1]["bank"], reverse=True)[:10]
@@ -163,7 +163,7 @@ async def leaderboard(ctx):
         embed.add_field(name=f"{i}. {name}", value=f"Total: {data['wallet']+data['bank']}$", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(aliases=["veprofile"])
+@bot.command()
 async def profile(ctx, member: discord.Member=None):
     member = member or ctx.author
     user = await get_user(member.id)
@@ -177,7 +177,7 @@ async def profile(ctx, member: discord.Member=None):
     await ctx.send(embed=embed)
 
 # ------------------------- DAILY, DROP, VOTE -------------------------
-@bot.command(aliases=["vedaily"])
+@bot.command()
 async def daily(ctx):
     user = await get_user(ctx.author.id)
     today = daily_reset()
@@ -193,7 +193,7 @@ async def daily(ctx):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ You claimed your daily and received **{amount}$**!")
 
-@bot.command(aliases=["vedrop"])
+@bot.command()
 async def drop(ctx):
     user = await get_user(ctx.author.id)
     now = datetime.datetime.utcnow()
@@ -215,7 +215,7 @@ async def drop(ctx):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ You claimed a drop and received **{amount}$**!")
 
-@bot.command(aliases=["vevote"])
+@bot.command()
 async def vote(ctx):
     user = await get_user(ctx.author.id)
     amount = 2000
@@ -247,7 +247,7 @@ async def removeplus(ctx, member: discord.Member):
     await ctx.send(f"✅ {member.mention} has been removed from **VRTEX+** membership!")
 
 # ------------------------- PREFIX CHANGE (VRTEX+ ONLY) -------------------------
-@bot.command(aliases=["veprefix"])
+@bot.command()
 async def prefix(ctx, new_prefix):
     if not await is_plus(ctx.author.id):
         await ctx.send("❌ Only VRTEX+ members can change server prefix!")
@@ -258,7 +258,7 @@ async def prefix(ctx, new_prefix):
     await ctx.send(f"✅ Server prefix changed to **{new_prefix}**")
 
 # ------------------------- PROMOTE -------------------------
-@bot.command(aliases=["vepromote"])
+@bot.command()
 async def promote(ctx):
     user = await get_user(ctx.author.id)
     # Promote automatically for now based on balance >= 10000
@@ -274,14 +274,14 @@ DEFAULT_JOBS = {
     "Merchant": {"pay": 1500, "xp": 60}
 }
 
-@bot.command(aliases=["vejobs"])
+@bot.command()
 async def vejobs(ctx):
     embed = discord.Embed(title="💼 Available Jobs", color=discord.Color.purple())
     for job, info in DEFAULT_JOBS.items():
         embed.add_field(name=job, value=f"Pay: {info['pay']}$ | XP: {info['xp']}", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(aliases=["veapplyjob"])
+@bot.command()
 async def veapplyjob(ctx, *, job_name):
     if job_name not in DEFAULT_JOBS:
         await ctx.send("❌ Job not found!")
@@ -292,7 +292,7 @@ async def veapplyjob(ctx, *, job_name):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ You have successfully applied for the **{job_name}** job!")
 
-@bot.command(aliases=["vequitjob"])
+@bot.command()
 async def vequitjob(ctx):
     user = await get_user(ctx.author.id)
     if not user["job"]:
@@ -304,7 +304,7 @@ async def vequitjob(ctx):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ You quit your **{job_name}** job.")
 
-@bot.command(aliases=["vework"])
+@bot.command()
 async def vework(ctx):
     user = await get_user(ctx.author.id)
     if not user["job"]:
@@ -334,7 +334,7 @@ DEFAULT_BUSINESSES = {
     "Tech Lab": {"cost": 100000, "profit": 15000, "upkeep": 2000, "tier": 5}
 }
 
-@bot.group(aliases=["vebusiness"], invoke_without_command=True)
+@bot.group(invoke_without_command=True)
 async def vebusiness(ctx):
     await ctx.send("❌ Use a subcommand: buy/upgrade/list/info/claim")
 
@@ -396,7 +396,7 @@ DEFAULT_ITEMS = {
     "Gem": {"price": 5000, "effect": "rare"}
 }
 
-@bot.command(aliases=["veinventory"])
+@bot.command()
 async def inventory(ctx):
     user = await get_user(ctx.author.id)
     if not user["items"]:
@@ -407,7 +407,7 @@ async def inventory(ctx):
         embed.add_field(name=item, value=f"Quantity: {qty}", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(aliases=["vebuy"])
+@bot.command()
 async def vebuy(ctx, *, item_name):
     if item_name not in DEFAULT_ITEMS:
         await ctx.send("❌ Item not found!")
@@ -422,7 +422,7 @@ async def vebuy(ctx, *, item_name):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ You bought 1 {item_name} for {price}$!")
 
-@bot.command(aliases=["vesell"])
+@bot.command()
 async def vesell(ctx, *, item_name):
     user = await get_user(ctx.author.id)
     if item_name not in user["items"] or user["items"][item_name] <= 0:
@@ -439,7 +439,7 @@ async def vesell(ctx, *, item_name):
 # ------------------------- ADVENTURE & QUESTS -------------------------
 ZONES = ["Forest", "Cave", "River", "Mountain"]
 
-@bot.command(aliases=["veadventure"])
+@bot.command()
 async def adventure(ctx):
     user = await get_user(ctx.author.id)
     zone = random.choice(ZONES)
@@ -668,7 +668,7 @@ async def veblackjack(ctx, amount: int):
     await ctx.send("🃏 Blackjack! Choose your move:", view=view)
 
 # ------------------------- SERVER SETTINGS -------------------------
-@bot.group(aliases=["vesettings"], invoke_without_command=True)
+@bot.group(invoke_without_command=True)
 async def vsettings(ctx):
     await ctx.send("❌ Use a subcommand: currency/tax/toggle/prefix")
 
@@ -703,12 +703,12 @@ async def toggle(ctx, command_name):
     save_json("servers", servers)
 
 # ------------------------- LEVEL & RANK -------------------------
-@bot.command(aliases=["velevel"])
+@bot.command()
 async def velevel(ctx):
     user = await get_user(ctx.author.id)
     await ctx.send(f"🎚️ Level: {user['level']} | XP: {user['xp']}")
 
-@bot.command(aliases=["verank"])
+@bot.command()
 async def verank(ctx):
     users = load_json("users")
     ranking = sorted(users.items(), key=lambda x: x[1]["xp"] + x[1]["level"]*100, reverse=True)
@@ -719,7 +719,7 @@ async def verank(ctx):
     await ctx.send("❌ You are not ranked yet.")
 
 # ------------------------- GENERAL INFO -------------------------
-@bot.command(aliases=["vehelp"])
+@bot.command()
 async def vehelp(ctx):
     commands_list = """
 💠 **VRTEX ECONOMY COMMANDS**
@@ -735,7 +735,7 @@ async def vehelp(ctx):
 """
     await ctx.send(commands_list)
 
-@bot.command(aliases=["veabout"])
+@bot.command()
 async def veabout(ctx):
     await ctx.send("💠 **VRTEX ECONOMY** | Created by VRTEX Team\nAll features: Economy, Jobs, Business, Adventure, Mini-Games, VRTEX+ Premium!")
 
@@ -743,6 +743,7 @@ async def veabout(ctx):
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
 
