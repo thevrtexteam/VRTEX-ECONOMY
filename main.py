@@ -39,17 +39,23 @@ FILES = {
     "economy": "economy.json"
 }
 
-# ensure files exist
+# ensure files exist and are valid json
 for fname in FILES.values():
     if not os.path.exists(fname):
-        with open(fname, "w") as f:
+        with open(fname, "w", encoding="utf-8") as f:
             json.dump({}, f)
 
 def load_json(file_key: str) -> dict:
     path = FILES[file_key]
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            # if file contains something else, reset
+            with open(path, "w", encoding="utf-8") as fw:
+                json.dump({}, fw)
+            return {}
     except Exception:
         # if corrupt or missing, recreate
         with open(path, "w", encoding="utf-8") as f:
@@ -149,6 +155,21 @@ async def add_xp(user_id: int, amount: int):
     return leveled
 
 # -----------------------------
+# Premium embed/theme helpers
+# -----------------------------
+def premium_color():
+    # dark theme with purple accent
+    return discord.Color.from_rgb(34, 37, 46)  # dark panel color
+
+def accent_color():
+    return discord.Color.from_rgb(153, 50, 204)  # purple accent
+
+def make_embed(title: str, description: str = None, color=None):
+    c = color or premium_color()
+    e = discord.Embed(title=title, description=description or "", color=c)
+    return e
+
+# -----------------------------
 # On ready
 # -----------------------------
 @bot.event
@@ -157,6 +178,7 @@ async def on_ready():
     print("💾 JSON storage ready")
     # ensure economy file entries exist for guilds bot is in
     econ = load_json("economy")
+    updated = False
     for g in bot.guilds:
         if str(g.id) not in econ:
             econ[str(g.id)] = {
@@ -165,10 +187,12 @@ async def on_ready():
                 "starting_balance": 0,
                 "tax_rate": 0
             }
-    save_json("economy", econ)
+            updated = True
+    if updated:
+        save_json("economy", econ)
 
 # -----------------------------
-# On guild join -> send setup message
+# On guild join -> send setup message (silent but visible to server)
 # -----------------------------
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -182,21 +206,22 @@ async def on_guild_join(guild: discord.Guild):
     if not target_channel:
         # nothing to do
         return
-    embed = discord.Embed(
-        title="💠 Thanks for inviting VRTEX Economy!",
-        description="Type `veletsgo` or press **Start Setup** to configure the economy for this server.",
-        color=discord.Color.blurple()
-    )
+    embed = make_embed("💠 Thanks for inviting VRTEX Economy!", "Type `veletsgo` or press **Start Setup** to configure the economy for this server.", accent_color())
     view = View()
     btn = Button(label="Start Setup (veletsgo)", style=discord.ButtonStyle.green)
+
     async def start_setup(interaction: discord.Interaction):
+        # permission check
         if interaction.user.guild_permissions.manage_guild or interaction.user.id == OWNER_ID or interaction.user.id in TEAM_IDS:
+            # defer then launch setup
             await interaction.response.defer()
             await launch_setup(interaction, guild, starter=interaction.user)
         else:
             await interaction.response.send_message("You need Manage Server (or be owner / team) to run setup.", ephemeral=True)
+
     btn.callback = start_setup
     view.add_item(btn)
+    # send as normal message (not ephemeral)
     await target_channel.send(embed=embed, view=view)
 
 # -----------------------------
@@ -221,84 +246,72 @@ class CurrencyModal(Modal, title="Currency setup"):
 
 async def launch_setup(interaction_or_ctx, guild: discord.Guild, starter: discord.Member):
     # send a paged setup view starting with an intro message
-    # create a persistent message for navigation (ephemeral if interaction)
     channel = None
     if isinstance(interaction_or_ctx, discord.Interaction):
         channel = interaction_or_ctx.channel
     else:
         channel = interaction_or_ctx
 
-    page = 1
-    # create a view with Next / Back / Finish
+    # SetupView with fixed signature ordering (interaction first, button second)
     class SetupView(View):
         def __init__(self, *, timeout=900):
             super().__init__(timeout=timeout)
             self.page = 1
+            self.guild = guild
+            self.starter = starter
 
-        async def send_page(self, interaction_or_ctx, who_initiated):
-            if isinstance(interaction_or_ctx, discord.Interaction):
-                respond = interaction_or_ctx.response
-            # build page content
-            econ = get_guild_economy(guild.id)
+        async def send_page(self, interaction: discord.Interaction):
+            econ = get_guild_economy(self.guild.id)
             if self.page == 1:
-                embed = discord.Embed(title="SETUP VRTEX ECONOMY FOR YOUR SERVER", color=discord.Color.blurple())
-                embed.add_field(name="Step 1 — Currency", value=f"Currency name: **{econ.get('currency_name', 'Coins')}**\nSymbol: **{econ.get('currency_symbol', '$')}**\n\nClick **Edit** to set currency name & symbol (modal).", inline=False)
-                embed.set_footer(text="These settings can be changed later with the command `vesettings`.")
-                if isinstance(interaction_or_ctx, discord.Interaction):
-                    await interaction_or_ctx.response.edit_message(embed=embed, view=self)
-                else:
-                    await interaction_or_ctx.send(embed=embed, view=self)
+                embed = make_embed("SETUP VRTEX ECONOMY — Step 1/3", None, accent_color())
+                embed.add_field(name="Currency", value=f"Name: **{econ.get('currency_name','Coins')}**\nSymbol: **{econ.get('currency_symbol','$')}**\n\nClick **Edit Currency** to change name & symbol (modal).", inline=False)
+                embed.set_footer(text="You can change these later with `vesettings`.")
+                await interaction.response.edit_message(embed=embed, view=self)
             elif self.page == 2:
-                embed = discord.Embed(title="Step 2 — Economy Options", color=discord.Color.blurple())
-                embed.add_field(name="Starting Balance", value=f"{econ.get('starting_balance', 0)} {econ.get('currency_symbol','')}", inline=False)
-                embed.add_field(name="Work Reward", value="Users will get 1000 per hour (can be changed later).", inline=False)
-                if isinstance(interaction_or_ctx, discord.Interaction):
-                    await interaction_or_ctx.response.edit_message(embed=embed, view=self)
-                else:
-                    await interaction_or_ctx.send(embed=embed, view=self)
+                embed = make_embed("SETUP VRTEX ECONOMY — Step 2/3", None, accent_color())
+                embed.add_field(name="Economy Options", value=f"Starting balance: **{econ.get('starting_balance',0)} {econ.get('currency_symbol','')}**\nWork reward: **1000 {econ.get('currency_symbol','')}** (per hour).", inline=False)
+                embed.set_footer(text="These are editable in vesettings.")
+                await interaction.response.edit_message(embed=embed, view=self)
             elif self.page == 3:
-                embed = discord.Embed(title="Step 3 — Confirm", color=discord.Color.green())
-                embed.add_field(name="Summary", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**\nWork: **1000 per hour**", inline=False)
-                if isinstance(interaction_or_ctx, discord.Interaction):
-                    await interaction_or_ctx.response.edit_message(embed=embed, view=self)
-                else:
-                    await interaction_or_ctx.send(embed=embed, view=self)
+                embed = make_embed("SETUP VRTEX ECONOMY — Step 3/3", None, discord.Color.green())
+                embed.add_field(name="Confirm & Finish", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**\nWork reward: **1000**", inline=False)
+                await interaction.response.edit_message(embed=embed, view=self)
 
+        # correct parameter order: interaction, button
         @discord.ui.button(label="<< Back", style=discord.ButtonStyle.secondary, row=0)
-        async def back(self, button: Button, interaction: discord.Interaction):
-            if interaction.user != starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+        async def back(self, interaction: discord.Interaction, button: Button):
+            # permission check
+            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
                 return await interaction.response.send_message("You are not allowed to navigate this setup.", ephemeral=True)
             if self.page > 1:
                 self.page -= 1
-            await self.send_page(interaction, starter)
+            await self.send_page(interaction)
 
         @discord.ui.button(label="Edit Currency", style=discord.ButtonStyle.gray, row=0)
-        async def edit_currency(self, button: Button, interaction: discord.Interaction):
-            if interaction.user != starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+        async def edit_currency(self, interaction: discord.Interaction, button: Button):
+            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
                 return await interaction.response.send_message("You are not allowed to edit.", ephemeral=True)
-            modal = CurrencyModal(guild, starter)
+            modal = CurrencyModal(self.guild, self.starter)
             await interaction.response.send_modal(modal)
 
         @discord.ui.button(label="Next >>", style=discord.ButtonStyle.primary, row=0)
-        async def nxt(self, button: Button, interaction: discord.Interaction):
-            if interaction.user != starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+        async def nxt(self, interaction: discord.Interaction, button: Button):
+            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
                 return await interaction.response.send_message("You are not allowed to navigate this setup.", ephemeral=True)
             if self.page < 3:
                 self.page += 1
-                await self.send_page(interaction, starter)
+                await self.send_page(interaction)
             else:
-                # finish
                 await interaction.response.send_message("✅ Setup complete! You can edit settings later with `vesettings`. Type `vehelp` to see all commands.", ephemeral=True)
                 self.stop()
 
-    # send initial message
+    # Create and send the initial embed message.
     view = SetupView()
-    embed = discord.Embed(title="SETUP VRTEX ECONOMY FOR YOUR SERVER", description="Press Next to begin or Edit Currency to set currency now.", color=discord.Color.blurple())
-    # If called from an interaction, reply; else send
     if isinstance(interaction_or_ctx, discord.Interaction):
-        await interaction_or_ctx.followup.send(embed=embed, view=view)
+        # Interaction was deferred earlier by caller; use followup to send a persistent message
+        await interaction_or_ctx.followup.send(embed=make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin or Edit Currency to set currency now.", accent_color()), view=view)
     else:
-        await interaction_or_ctx.send(embed=embed, view=view)
+        await interaction_or_ctx.send(embed=make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin or Edit Currency to set currency now.", accent_color()), view=view)
 
 # wrapper command to start setup manually
 @bot.command()
@@ -306,12 +319,59 @@ async def veletsgo(ctx):
     if not (ctx.author.guild_permissions.manage_guild or ctx.author.id in TEAM_IDS or ctx.author.id == OWNER_ID):
         await ctx.send("You need Manage Server permission (or be owner/team) to run setup.")
         return
-    await launch_setup(ctx, ctx.guild, starter=ctx.author)
+    # For manual invocation we create the SetupView and send it (no defer)
+    class ManualSetupView(View):
+        def __init__(self, *, timeout=900):
+            super().__init__(timeout=timeout)
+            self.page = 1
+            self.guild = ctx.guild
+            self.starter = ctx.author
+
+        async def send_page(self, interaction: discord.Interaction):
+            econ = get_guild_economy(self.guild.id)
+            if self.page == 1:
+                embed = make_embed("SETUP VRTEX ECONOMY — Step 1/3", None, accent_color())
+                embed.add_field(name="Currency", value=f"Name: **{econ.get('currency_name','Coins')}**\nSymbol: **{econ.get('currency_symbol','$')}**", inline=False)
+                await interaction.response.edit_message(embed=embed, view=self)
+            elif self.page == 2:
+                embed = make_embed("SETUP VRTEX ECONOMY — Step 2/3", None, accent_color())
+                embed.add_field(name="Economy Options", value=f"Starting balance: **{econ.get('starting_balance',0)}**", inline=False)
+                await interaction.response.edit_message(embed=embed, view=self)
+            else:
+                embed = make_embed("SETUP VRTEX ECONOMY — Step 3/3", None, discord.Color.green())
+                await interaction.response.edit_message(embed=embed, view=self)
+
+        @discord.ui.button(label="<< Back", style=discord.ButtonStyle.secondary)
+        async def back(self, interaction: discord.Interaction, button: Button):
+            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+                return await interaction.response.send_message("Not allowed.", ephemeral=True)
+            if self.page > 1:
+                self.page -= 1
+            await self.send_page(interaction)
+
+        @discord.ui.button(label="Edit Currency", style=discord.ButtonStyle.gray)
+        async def edit_currency(self, interaction: discord.Interaction, button: Button):
+            modal = CurrencyModal(self.guild, self.starter)
+            await interaction.response.send_modal(modal)
+
+        @discord.ui.button(label="Next >>", style=discord.ButtonStyle.primary)
+        async def nxt(self, interaction: discord.Interaction, button: Button):
+            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+                return await interaction.response.send_message("Not allowed.", ephemeral=True)
+            if self.page < 3:
+                self.page += 1
+                await self.send_page(interaction)
+            else:
+                await interaction.response.send_message("✅ Setup complete!", ephemeral=True)
+                self.stop()
+
+    view = ManualSetupView()
+    # Send initial message
+    await ctx.send(embed=make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin or Edit Currency to set currency now.", accent_color()), view=view)
 
 # -----------------------------
 # Economy / Core commands
 # -----------------------------
-# multiple names requested: implement vebal (main) and extra commands that just forward to same handler
 async def send_balance_embed(ctx, member: Optional[discord.Member] = None):
     member = member or ctx.author
     user = await get_user(member.id)
@@ -320,7 +380,7 @@ async def send_balance_embed(ctx, member: Optional[discord.Member] = None):
     sym = guild_econ.get("currency_symbol", "")
     wallet = user.get("wallet", 0)
     bank = user.get("bank", 0)
-    embed = discord.Embed(title=f"{member.display_name}'s Balance", color=discord.Color.green())
+    embed = make_embed(f"{member.display_name}'s Balance", None, premium_color())
     embed.add_field(name=f"{name} (Wallet)", value=f"{wallet} {sym}", inline=True)
     embed.add_field(name=f"{name} (Bank)", value=f"{bank} {sym}", inline=True)
     embed.add_field(name="Membership", value="VRTEX+" if user.get("membership") else "Normal", inline=False)
@@ -331,7 +391,7 @@ async def send_balance_embed(ctx, member: Optional[discord.Member] = None):
 async def vebal(ctx, member: discord.Member=None):
     await send_balance_embed(ctx, member)
 
-# extra variants requested (no aliases, separate commands that call same logic)
+# extra variants (separate commands that call same logic)
 @bot.command()
 async def vewallet(ctx, member: discord.Member=None):
     await send_balance_embed(ctx, member)
@@ -385,21 +445,19 @@ async def vetransfer(ctx, member: discord.Member, amount: int):
 @bot.command()
 async def veleaderboard(ctx):
     users = load_json("users")
-    # compute total per user
     ranking = []
     for uid, data in users.items():
         total = data.get('wallet', 0) + data.get('bank', 0)
         ranking.append((uid, total))
     ranking.sort(key=lambda x: x[1], reverse=True)
-    embed = discord.Embed(title="💰 Top Richest Users", color=discord.Color.gold())
+    embed = make_embed("💰 Top Richest Users", None, accent_color())
     guild = ctx.guild
     count = 0
     for uid, total in ranking:
         if count >= 10:
             break
-        # only show users that exist in this guild (optional): we will show all — but try to resolve member
         try:
-            member = guild.get_member(int(uid))
+            member = guild.get_member(int(uid)) if guild else None
             name = member.display_name if member else f"User {uid}"
         except Exception:
             name = f"User {uid}"
@@ -412,7 +470,7 @@ async def veprofile(ctx, member: discord.Member=None):
     member = member or ctx.author
     user = await get_user(member.id)
     econ = get_guild_economy(ctx.guild.id)
-    embed = discord.Embed(title=f"{member.display_name}'s Profile", color=discord.Color.blue())
+    embed = make_embed(f"{member.display_name}'s Profile", None, premium_color())
     embed.add_field(name="Balance", value=f"{user.get('wallet',0)+user.get('bank',0)}{econ.get('currency_symbol','')}", inline=False)
     embed.add_field(name="Level & XP", value=f"Level {user.get('level',1)} (XP: {user.get('xp',0)})", inline=False)
     embed.add_field(name="Job", value=user.get('job') or "Unemployed", inline=False)
@@ -438,7 +496,7 @@ async def vework(ctx):
                 await ctx.send(f"❌ You can work again in **{readable_time_delta(cooldown - delta)}**")
                 return
         except Exception:
-            # if parsing fails, allow
+            # parsing error => allow
             pass
     reward = 1000
     # plus members get bonus
@@ -494,7 +552,7 @@ async def veslots(ctx, amount: int):
     await update_user(ctx.author.id, user)
     emojis = ["🍒", "🍋", "🍉", "⭐", "💎"]
     res = [random.choice(emojis) for _ in range(3)]
-    embed = discord.Embed(title="🎰 Slots", description=" | ".join(res), color=discord.Color.gold())
+    embed = make_embed("🎰 Slots", " | ".join(res), accent_color())
     if res[0] == res[1] == res[2]:
         winnings = amount * 2
         user['wallet'] += winnings
@@ -505,7 +563,7 @@ async def veslots(ctx, amount: int):
     await ctx.send(embed=embed)
 
 # -----------------------------
-# vebusiness simplified group (command names intentionally explicit)
+# vebusiness simplified group
 # -----------------------------
 DEFAULT_BUSINESSES = {
     "Bakery": {"cost": 5000, "profit": 500, "upkeep": 50, "tier": 1},
@@ -520,7 +578,7 @@ async def vebusiness(ctx):
 
 @vebusiness.command()
 async def list(ctx):
-    embed = discord.Embed(title="🏠 Available Businesses", color=discord.Color.orange())
+    embed = make_embed("🏠 Available Businesses", None, accent_color())
     for name, info in DEFAULT_BUSINESSES.items():
         embed.add_field(name=name, value=f"Cost: {info['cost']}{get_guild_economy(ctx.guild.id).get('currency_symbol','')} | Profit: {info['profit']}", inline=False)
     await ctx.send(embed=embed)
@@ -555,7 +613,7 @@ async def info(ctx, *, name: str):
     if name not in DEFAULT_BUSINESSES:
         return await ctx.send("❌ Business not found.")
     info = DEFAULT_BUSINESSES[name]
-    embed = discord.Embed(title=f"{name} Info", color=discord.Color.orange())
+    embed = make_embed(f"{name} Info", None, accent_color())
     embed.add_field(name="Cost", value=str(info['cost']), inline=True)
     embed.add_field(name="Profit", value=str(info['profit']), inline=True)
     embed.add_field(name="Tier", value=str(info['tier']), inline=True)
@@ -569,7 +627,7 @@ async def vesettings(ctx):
     if not (ctx.author.guild_permissions.manage_guild or ctx.author.id in TEAM_IDS or ctx.author.id == OWNER_ID):
         return await ctx.send("You need Manage Server permission (or be owner/team) to use vesettings.")
     econ = get_guild_economy(ctx.guild.id)
-    embed = discord.Embed(title="⚙️ VRTEX Settings", description="Choose a category below to configure.", color=discord.Color.blurple())
+    embed = make_embed("⚙️ VRTEX Settings", None, accent_color())
     embed.add_field(name="Current", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**\nTax: **{econ.get('tax_rate',0)}%**", inline=False)
 
     class SettingsView(View):
@@ -577,17 +635,17 @@ async def vesettings(ctx):
             super().__init__(timeout=300)
 
         @discord.ui.button(label="Economy", style=discord.ButtonStyle.primary)
-        async def economy_btn(self, button: Button, interaction: discord.Interaction):
-            await interaction.response.defer()
+        async def economy_btn(self, interaction: discord.Interaction, button: Button):
+            await interaction.response.defer(ephemeral=True)
             await show_economy_options(interaction, ctx.guild)
 
         @discord.ui.button(label="Commands toggle", style=discord.ButtonStyle.secondary)
-        async def toggle_btn(self, button: Button, interaction: discord.Interaction):
-            await interaction.response.defer()
+        async def toggle_btn(self, interaction: discord.Interaction, button: Button):
+            await interaction.response.defer(ephemeral=True)
             await show_toggle_options(interaction, ctx.guild)
 
         @discord.ui.button(label="Prefix", style=discord.ButtonStyle.gray)
-        async def prefix_btn(self, button: Button, interaction: discord.Interaction):
+        async def prefix_btn(self, interaction: discord.Interaction, button: Button):
             await interaction.response.send_message("To change prefix use `veprefix <newprefix>` (only VRTEX+ members can do this).", ephemeral=True)
 
     view = SettingsView()
@@ -608,7 +666,6 @@ async def show_economy_options(interaction: discord.Interaction, guild: discord.
             modal = CurrencyModal(guild, inter.user)
             await inter.response.send_modal(modal)
         elif choice == "startbal":
-            # ask via modal
             class StartBalModal(Modal, title="Set Starting Balance"):
                 amount = TextInput(label="Starting balance (integer)", placeholder="e.g. 100", required=True, max_length=12)
                 def __init__(self, guild, user):
@@ -645,11 +702,10 @@ async def show_economy_options(interaction: discord.Interaction, guild: discord.
     await interaction.followup.send("Choose an economy setting to edit:", view=view, ephemeral=True)
 
 async def show_toggle_options(interaction: discord.Interaction, guild: discord.Guild):
-    # show a list of commands which can be toggled (simple demo)
     servers = load_json("servers")
     servers[str(guild.id)] = servers.get(str(guild.id), {})
     disabled = servers[str(guild.id)].get("disabled_commands", [])
-    COMMANDS = ["vework","vecf","veslots","vebusiness","vehelp","vebalance"]
+    COMMANDS = ["vework","vecf","veslots","vebusiness","vehelp","vebal"]
     options = []
     for c in COMMANDS:
         label = f"{c} {'(disabled)' if c in disabled else '(enabled)'}"
@@ -675,14 +731,14 @@ async def show_toggle_options(interaction: discord.Interaction, guild: discord.G
 # -----------------------------
 @bot.command()
 async def vehelp(ctx):
-    embed = discord.Embed(title="💠 VRTEX ECONOMY — Help", description="Choose a category to view commands.", color=discord.Color.blurple())
+    embed = make_embed("💠 VRTEX ECONOMY — Help", "Choose a category to view commands.", accent_color())
     embed.add_field(name="Categories", value="Economy • Games • Businesses • Server • Info", inline=False)
     view = View()
 
     async def send_economy(interaction: discord.Interaction):
         econ = get_guild_economy(ctx.guild.id)
         sym = econ.get('currency_symbol','')
-        e = discord.Embed(title="Economy Commands", color=discord.Color.green())
+        e = make_embed("Economy Commands", None, premium_color())
         e.add_field(name="Balance", value="`vebal` `vewallet` `vepocket` `vebank` `vecash` — show balances", inline=False)
         e.add_field(name="Deposit / Withdraw", value="`vedeposit <amount>` | `vewithdraw <amount>`", inline=False)
         e.add_field(name="Transfer", value="`vetransfer @user <amount>`", inline=False)
@@ -690,23 +746,23 @@ async def vehelp(ctx):
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     async def send_games(interaction: discord.Interaction):
-        e = discord.Embed(title="Games / Mini-Games", color=discord.Color.gold())
+        e = make_embed("Games / Mini-Games", None, premium_color())
         e.add_field(name="Coinflip", value="`vecf <amount|'all'>` — coinflip", inline=False)
         e.add_field(name="Slots", value="`veslots <amount>`", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     async def send_business(interaction: discord.Interaction):
-        e = discord.Embed(title="Business Commands", color=discord.Color.orange())
+        e = make_embed("Business Commands", None, premium_color())
         e.add_field(name="Business group", value="`vebusiness list` | `vebusiness buy <name>` | `vebusiness claim` | `vebusiness info <name>`", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     async def send_server(interaction: discord.Interaction):
-        e = discord.Embed(title="Server & Settings", color=discord.Color.blurple())
+        e = make_embed("Server & Settings", None, premium_color())
         e.add_field(name="Setup & Settings", value="`veletsgo` — start setup | `vesettings` — interactive settings (Manage Server only)", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     async def send_info(interaction: discord.Interaction):
-        e = discord.Embed(title="Info & Misc", color=discord.Color.blue())
+        e = make_embed("Info & Misc", None, premium_color())
         e.add_field(name="Profile & Leaderboard", value="`veprofile` | `veleaderboard`", inline=False)
         e.add_field(name="Help", value="You're here! `vehelp`", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
@@ -717,11 +773,23 @@ async def vehelp(ctx):
     b_server = Button(label="Server", style=discord.ButtonStyle.gray)
     b_info = Button(label="Info", style=discord.ButtonStyle.blurple)
 
-    b_econ.callback = lambda inter: asyncio.create_task(send_economy(inter))
-    b_games.callback = lambda inter: asyncio.create_task(send_games(inter))
-    b_biz.callback = lambda inter: asyncio.create_task(send_business(inter))
-    b_server.callback = lambda inter: asyncio.create_task(send_server(inter))
-    b_info.callback = lambda inter: asyncio.create_task(send_info(inter))
+    # callbacks must accept a single interaction param -> wrap into tasks
+    async def wrap_send_economy(interaction: discord.Interaction):
+        await send_economy(interaction)
+    async def wrap_send_games(interaction: discord.Interaction):
+        await send_games(interaction)
+    async def wrap_send_business(interaction: discord.Interaction):
+        await send_business(interaction)
+    async def wrap_send_server(interaction: discord.Interaction):
+        await send_server(interaction)
+    async def wrap_send_info(interaction: discord.Interaction):
+        await send_info(interaction)
+
+    b_econ.callback = lambda inter: asyncio.create_task(wrap_send_economy(inter))
+    b_games.callback = lambda inter: asyncio.create_task(wrap_send_games(inter))
+    b_biz.callback = lambda inter: asyncio.create_task(wrap_send_business(inter))
+    b_server.callback = lambda inter: asyncio.create_task(wrap_send_server(inter))
+    b_info.callback = lambda inter: asyncio.create_task(wrap_send_info(inter))
 
     view.add_item(b_econ)
     view.add_item(b_games)
