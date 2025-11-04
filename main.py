@@ -193,7 +193,7 @@ async def daily(ctx):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ You claimed your daily and received **{amount}$**!")
 
-@bot.command(aliases=["vedrop", "drop"])
+@bot.command(aliases=["vedrop"])
 async def drop(ctx):
     user = await get_user(ctx.author.id)
     now = datetime.datetime.utcnow()
@@ -215,7 +215,7 @@ async def drop(ctx):
     await update_user(ctx.author.id, user)
     await ctx.send(f"✅ You claimed a drop and received **{amount}$**!")
 
-@bot.command(aliases=["vevote", "vote"])
+@bot.command(aliases=["vevote"])
 async def vote(ctx):
     user = await get_user(ctx.author.id)
     amount = 2000
@@ -743,5 +743,6 @@ async def veabout(ctx):
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
