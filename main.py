@@ -740,9 +740,8 @@ async def veabout(ctx):
     await ctx.send("💠 **VRTEX ECONOMY** | Created by VRTEX Team\nAll features: Economy, Jobs, Business, Adventure, Mini-Games, VRTEX+ Premium!")
 
 # ------------------------- RUN BOT -------------------------
-keep_alive()
-
 bot.run(TOKEN)
+
 
 
 
