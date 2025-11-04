@@ -177,7 +177,7 @@ async def profile(ctx, member: discord.Member=None):
     await ctx.send(embed=embed)
 
 # ------------------------- DAILY, DROP, VOTE -------------------------
-@bot.command(aliases=["vedaily", "daily"])
+@bot.command(aliases=["vedaily"])
 async def daily(ctx):
     user = await get_user(ctx.author.id)
     today = daily_reset()
@@ -247,7 +247,7 @@ async def removeplus(ctx, member: discord.Member):
     await ctx.send(f"✅ {member.mention} has been removed from **VRTEX+** membership!")
 
 # ------------------------- PREFIX CHANGE (VRTEX+ ONLY) -------------------------
-@bot.command(aliases=["veprefix", "prefix"])
+@bot.command(aliases=["veprefix"])
 async def prefix(ctx, new_prefix):
     if not await is_plus(ctx.author.id):
         await ctx.send("❌ Only VRTEX+ members can change server prefix!")
@@ -258,7 +258,7 @@ async def prefix(ctx, new_prefix):
     await ctx.send(f"✅ Server prefix changed to **{new_prefix}**")
 
 # ------------------------- PROMOTE -------------------------
-@bot.command(aliases=["vepromote", "promote"])
+@bot.command(aliases=["vepromote"])
 async def promote(ctx):
     user = await get_user(ctx.author.id)
     # Promote automatically for now based on balance >= 10000
@@ -743,4 +743,5 @@ async def veabout(ctx):
 keep_alive()
 
 bot.run(TOKEN)
+
 
