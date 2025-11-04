@@ -163,7 +163,7 @@ async def leaderboard(ctx):
         embed.add_field(name=f"{i}. {name}", value=f"Total: {data['wallet']+data['bank']}$", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(aliases=["veprofile", "profile"])
+@bot.command(aliases=["veprofile"])
 async def profile(ctx, member: discord.Member=None):
     member = member or ctx.author
     user = await get_user(member.id)
@@ -743,3 +743,4 @@ async def veabout(ctx):
 keep_alive()
 
 bot.run(TOKEN)
+
