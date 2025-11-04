@@ -258,7 +258,7 @@ class CurrencyModal(Modal, title="Currency setup"):
                     embed.set_footer(text="These are editable later with `vesettings`.")
                     # ensure Next label is accurate
                     for child in self.setup_view.children:
-                        if isinstance(child, Button) and child.label.startswith("Next"):
+                        if isinstance(child, Button) and child.custom_id == "sv_next":
                             child.label = "Next >>"
                     await self.setup_view.message.edit(embed=embed, view=self.setup_view)
             except Exception:
@@ -737,44 +737,52 @@ async def show_toggle_options(interaction: discord.Interaction, guild: discord.G
     await interaction.followup.send("Choose a command to toggle:", view=view, ephemeral=True)
 
 # -----------------------------
-# vehelp interactive
+# vehelp interactive (improved & attractive)
 # -----------------------------
 @bot.command()
 async def vehelp(ctx):
-    embed = make_embed("💠 VRTEX ECONOMY — Help", "Choose a category to view commands.", accent_color())
-    embed.add_field(name="Categories", value="Economy • Games • Businesses • Server • Info", inline=False)
+    # main attractive embed with quick usage lines
+    econ = get_guild_economy(ctx.guild.id) if ctx.guild else {"currency_symbol": "$"}
+    sym = econ.get("currency_symbol", "")
+    embed = discord.Embed(
+        title="💠 VRTEX Economy — Command Center",
+        description="Click the buttons below to view command categories. Tip: use `ve` as prefix (e.g. `vebal`).",
+        color=discord.Color.from_rgb(88, 101, 242)
+    )
+    embed.set_thumbnail(url="https://i.imgur.com/0X9bK9d.png")  # placeholder nice thumbnail (replace if you want)
+    embed.add_field(name="Quick Start", value=f"`vework` — earn **1000{sym}** / hour\n`vebal` — show balance\n`vecf <amt|'all'>` — coinflip", inline=False)
+    embed.add_field(name="Premium", value="VRTEX+ members get better rewards and perks.", inline=False)
+    embed.set_footer(text="Use the buttons below — replies are ephemeral (private) so your chat stays clean.")
     view = View()
 
-    async def send_economy(interaction: discord.Interaction):
-        econ = get_guild_economy(ctx.guild.id)
-        sym = econ.get('currency_symbol','')
-        e = make_embed("Economy Commands", None, premium_color())
+    async def economy_cb(interaction: discord.Interaction):
+        e = discord.Embed(title="📊 Economy Commands", color=discord.Color.green())
         e.add_field(name="Balance", value="`vebal` `vewallet` `vepocket` `vebank` `vecash` — show balances", inline=False)
         e.add_field(name="Deposit / Withdraw", value="`vedeposit <amount>` | `vewithdraw <amount>`", inline=False)
         e.add_field(name="Transfer", value="`vetransfer @user <amount>`", inline=False)
         e.add_field(name="Work", value=f"`vework` — earn **1000{sym}** (once per hour)", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    async def send_games(interaction: discord.Interaction):
-        e = make_embed("Games / Mini-Games", None, premium_color())
+    async def games_cb(interaction: discord.Interaction):
+        e = discord.Embed(title="🎮 Games & Mini-Games", color=discord.Color.gold())
         e.add_field(name="Coinflip", value="`vecf <amount|'all'>` — coinflip", inline=False)
-        e.add_field(name="Slots", value="`veslots <amount>`", inline=False)
+        e.add_field(name="Slots", value="`veslots <amount>` — try your luck", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    async def send_business(interaction: discord.Interaction):
-        e = make_embed("Business Commands", None, premium_color())
-        e.add_field(name="Business group", value="`vebusiness list` | `vebusiness buy <name>` | `vebusiness claim` | `vebusiness info <name>`", inline=False)
+    async def biz_cb(interaction: discord.Interaction):
+        e = discord.Embed(title="🏬 Businesses", color=discord.Color.orange())
+        e.add_field(name="Business commands", value="`vebusiness list` | `vebusiness buy <name>` | `vebusiness claim` | `vebusiness info <name>`", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    async def send_server(interaction: discord.Interaction):
-        e = make_embed("Server & Settings", None, premium_color())
-        e.add_field(name="Setup & Settings", value="`veletsgo` — start setup | `vesettings` — interactive settings (Manage Server only)", inline=False)
+    async def server_cb(interaction: discord.Interaction):
+        e = discord.Embed(title="⚙️ Server & Settings", color=discord.Color.blurple())
+        e.add_field(name="Setup & Settings", value="`veletsgo` — start server setup\n`vesettings` — interactive settings (Manage Server only)", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    async def send_info(interaction: discord.Interaction):
-        e = make_embed("Info & Misc", None, premium_color())
+    async def info_cb(interaction: discord.Interaction):
+        e = discord.Embed(title="ℹ️ Info", color=discord.Color.blue())
         e.add_field(name="Profile & Leaderboard", value="`veprofile` | `veleaderboard`", inline=False)
-        e.add_field(name="Help", value="You're here! `vehelp`", inline=False)
+        e.add_field(name="Help", value="You're viewing it! `vehelp`", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     b_econ = Button(label="Economy", style=discord.ButtonStyle.primary)
@@ -783,23 +791,11 @@ async def vehelp(ctx):
     b_server = Button(label="Server", style=discord.ButtonStyle.gray)
     b_info = Button(label="Info", style=discord.ButtonStyle.blurple)
 
-    # callbacks must accept a single interaction param -> wrap into tasks
-    async def wrap_send_economy(interaction: discord.Interaction):
-        await send_economy(interaction)
-    async def wrap_send_games(interaction: discord.Interaction):
-        await send_games(interaction)
-    async def wrap_send_business(interaction: discord.Interaction):
-        await send_business(interaction)
-    async def wrap_send_server(interaction: discord.Interaction):
-        await send_server(interaction)
-    async def wrap_send_info(interaction: discord.Interaction):
-        await send_info(interaction)
-
-    b_econ.callback = lambda inter: asyncio.create_task(wrap_send_economy(inter))
-    b_games.callback = lambda inter: asyncio.create_task(wrap_send_games(inter))
-    b_biz.callback = lambda inter: asyncio.create_task(wrap_send_business(inter))
-    b_server.callback = lambda inter: asyncio.create_task(wrap_send_server(inter))
-    b_info.callback = lambda inter: asyncio.create_task(wrap_send_info(inter))
+    b_econ.callback = lambda inter: asyncio.create_task(economy_cb(inter))
+    b_games.callback = lambda inter: asyncio.create_task(games_cb(inter))
+    b_biz.callback = lambda inter: asyncio.create_task(biz_cb(inter))
+    b_server.callback = lambda inter: asyncio.create_task(server_cb(inter))
+    b_info.callback = lambda inter: asyncio.create_task(info_cb(inter))
 
     view.add_item(b_econ)
     view.add_item(b_games)
@@ -810,15 +806,39 @@ async def vehelp(ctx):
     await ctx.send(embed=embed, view=view)
 
 # -----------------------------
-# small safety: prevent disabled commands (simple check)
+# small safety: prevent disabled commands (robust)
 # -----------------------------
 @bot.check
 async def global_command_block(ctx):
+    # Allow DMs / missing guild gracefully
+    if ctx.guild is None:
+        return True
+
+    # Always allow help
+    if ctx.command and ctx.command.name == "vehelp":
+        return True
+
     servers = load_json("servers")
-    disabled = servers.get(str(ctx.guild.id), {}).get("disabled_commands", []) if ctx.guild else []
-    if ctx.command and ctx.command.name in disabled:
-        await ctx.send("That command is currently disabled on this server.")
+    server_entry = servers.get(str(ctx.guild.id), {})
+    disabled = server_entry.get("disabled_commands", [])
+
+    cmd_name = ctx.command.name if ctx.command else None
+
+    # If there's no command object, allow (or let discord handle unknown commands)
+    if not cmd_name:
+        return True
+
+    # If command is disabled on this server, block and inform (and log)
+    if cmd_name in disabled:
+        try:
+            await ctx.send(f"⚠️ The command `{cmd_name}` is currently disabled on this server.")
+        except Exception:
+            # ignore send errors
+            pass
+        # log to console for easier debugging
+        print(f"[COMMAND BLOCKED] {ctx.guild.name}({ctx.guild.id}) blocked command: {cmd_name}")
         return False
+
     return True
 
 # -----------------------------
