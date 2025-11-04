@@ -158,7 +158,7 @@ async def add_xp(user_id: int, amount: int):
 # Premium embed/theme helpers
 # -----------------------------
 def premium_color():
-    # dark theme with purple accent
+    # dark theme with purple accent (used as default embed color)
     return discord.Color.from_rgb(34, 37, 46)  # dark panel color
 
 def accent_color():
@@ -231,18 +231,39 @@ class CurrencyModal(Modal, title="Currency setup"):
     currency_name = TextInput(label="Currency name", placeholder="Coins, Gold, VRTEX", required=True, max_length=40)
     currency_symbol = TextInput(label="Currency symbol (optional)", placeholder="$ or V", required=False, max_length=6)
 
-    def __init__(self, guild: discord.Guild, starter: discord.Member):
+    def __init__(self, guild: discord.Guild, starter: discord.Member, setup_view = None):
         super().__init__()
         self.guild = guild
         self.starter = starter
+        # reference to the SetupView instance that launched this modal (optional,
+        # used so the modal can cause the setup message to advance)
+        self.setup_view = setup_view
 
     async def on_submit(self, interaction: discord.Interaction):
-        # save to economy
-        set_guild_economy(self.guild.id, {
-            "currency_name": self.currency_name.value.strip(),
-            "currency_symbol": self.currency_symbol.value.strip() or ""
-        })
-        await interaction.response.send_message(f"✅ Currency set to **{self.currency_name.value.strip()}** `{self.currency_symbol.value.strip()}`. You can change this later with `vesettings`.", ephemeral=True)
+        name = self.currency_name.value.strip()
+        sym = self.currency_symbol.value.strip()
+        set_guild_economy(self.guild.id, {"currency_name": name or "Coins", "currency_symbol": sym or ""})
+        # reply to the modal submit
+        await interaction.response.send_message(f"✅ Currency set to **{name}** `{sym}`. Proceeding to next step...", ephemeral=True)
+        # If the modal was launched from a SetupView, ask it to advance to next page and update the setup message
+        if self.setup_view:
+            try:
+                # move to next page and update the persistent setup message
+                self.setup_view.page = 2
+                # update the persistent message
+                if getattr(self.setup_view, "message", None):
+                    econ = get_guild_economy(self.guild.id)
+                    embed = make_embed("SETUP VRTEX ECONOMY — Step 2/3", None, accent_color())
+                    embed.add_field(name="Economy Options", value=f"Starting balance: **{econ.get('starting_balance',0)} {econ.get('currency_symbol','')}**\nWork reward: **1000 {econ.get('currency_symbol','')}** (per hour).", inline=False)
+                    embed.set_footer(text="These are editable later with `vesettings`.")
+                    # ensure Next label is accurate
+                    for child in self.setup_view.children:
+                        if isinstance(child, Button) and child.label.startswith("Next"):
+                            child.label = "Next >>"
+                    await self.setup_view.message.edit(embed=embed, view=self.setup_view)
+            except Exception:
+                # silent fail (we already replied to modal)
+                pass
 
 async def launch_setup(interaction_or_ctx, guild: discord.Guild, starter: discord.Member):
     # send a paged setup view starting with an intro message
@@ -252,66 +273,103 @@ async def launch_setup(interaction_or_ctx, guild: discord.Guild, starter: discor
     else:
         channel = interaction_or_ctx
 
-    # SetupView with fixed signature ordering (interaction first, button second)
+    # SetupView with correct callback signatures and only Back/Next (Next -> finish on page 3)
     class SetupView(View):
         def __init__(self, *, timeout=900):
             super().__init__(timeout=timeout)
             self.page = 1
             self.guild = guild
             self.starter = starter
+            self.message: Optional[discord.Message] = None  # will hold the persistent message
 
-        async def send_page(self, interaction: discord.Interaction):
+        async def update_message_embed(self):
             econ = get_guild_economy(self.guild.id)
             if self.page == 1:
                 embed = make_embed("SETUP VRTEX ECONOMY — Step 1/3", None, accent_color())
-                embed.add_field(name="Currency", value=f"Name: **{econ.get('currency_name','Coins')}**\nSymbol: **{econ.get('currency_symbol','$')}**\n\nClick **Edit Currency** to change name & symbol (modal).", inline=False)
+                embed.add_field(name="Currency", value=f"Name: **{econ.get('currency_name','Coins')}**\nSymbol: **{econ.get('currency_symbol','$')}**\n\nWhen you press **Next >>** you'll be asked to type the currency name & symbol.", inline=False)
                 embed.set_footer(text="You can change these later with `vesettings`.")
-                await interaction.response.edit_message(embed=embed, view=self)
             elif self.page == 2:
                 embed = make_embed("SETUP VRTEX ECONOMY — Step 2/3", None, accent_color())
                 embed.add_field(name="Economy Options", value=f"Starting balance: **{econ.get('starting_balance',0)} {econ.get('currency_symbol','')}**\nWork reward: **1000 {econ.get('currency_symbol','')}** (per hour).", inline=False)
-                embed.set_footer(text="These are editable in vesettings.")
-                await interaction.response.edit_message(embed=embed, view=self)
-            elif self.page == 3:
+                embed.set_footer(text="These are editable later with `vesettings`.")
+            else:
                 embed = make_embed("SETUP VRTEX ECONOMY — Step 3/3", None, discord.Color.green())
                 embed.add_field(name="Confirm & Finish", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**\nWork reward: **1000**", inline=False)
-                await interaction.response.edit_message(embed=embed, view=self)
+                embed.set_footer(text="Press Finish to complete setup.")
+            # update label for Next button to become Finish on page 3
+            for child in self.children:
+                if isinstance(child, Button) and child.custom_id == "sv_next":
+                    child.label = "Finish" if self.page == 3 else "Next >>"
+            # edit persistent message
+            if self.message:
+                await self.message.edit(embed=embed, view=self)
 
-        # correct parameter order: interaction, button
-        @discord.ui.button(label="<< Back", style=discord.ButtonStyle.secondary, row=0)
+        # Back button (interaction first, button second)
+        @discord.ui.button(label="<< Back", style=discord.ButtonStyle.secondary, custom_id="sv_back")
         async def back(self, interaction: discord.Interaction, button: Button):
-            # permission check
             if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
                 return await interaction.response.send_message("You are not allowed to navigate this setup.", ephemeral=True)
             if self.page > 1:
                 self.page -= 1
-            await self.send_page(interaction)
+                await interaction.response.defer()
+                await self.update_message_embed()
+            else:
+                # if on page 1, just acknowledge
+                await interaction.response.send_message("You're already on the first page.", ephemeral=True)
 
-        @discord.ui.button(label="Edit Currency", style=discord.ButtonStyle.gray, row=0)
-        async def edit_currency(self, interaction: discord.Interaction, button: Button):
-            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
-                return await interaction.response.send_message("You are not allowed to edit.", ephemeral=True)
-            modal = CurrencyModal(self.guild, self.starter)
-            await interaction.response.send_modal(modal)
-
-        @discord.ui.button(label="Next >>", style=discord.ButtonStyle.primary, row=0)
+        # Next / Finish button
+        @discord.ui.button(label="Next >>", style=discord.ButtonStyle.primary, custom_id="sv_next")
         async def nxt(self, interaction: discord.Interaction, button: Button):
             if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
                 return await interaction.response.send_message("You are not allowed to navigate this setup.", ephemeral=True)
-            if self.page < 3:
-                self.page += 1
-                await self.send_page(interaction)
-            else:
-                await interaction.response.send_message("✅ Setup complete! You can edit settings later with `vesettings`. Type `vehelp` to see all commands.", ephemeral=True)
-                self.stop()
 
-    # Create and send the initial embed message.
+            # If on page 1: present CurrencyModal, the modal will set currency and advance page to 2
+            if self.page == 1:
+                modal = CurrencyModal(self.guild, self.starter, setup_view=self)
+                # show modal to user
+                await interaction.response.send_modal(modal)
+                # do not advance page here; the modal's on_submit will set page=2 and update the message
+                return
+
+            # If on page 2: go to page 3
+            if self.page == 2:
+                self.page = 3
+                await interaction.response.defer()
+                await self.update_message_embed()
+                return
+
+            # If on page 3: Finish
+            if self.page == 3:
+                # disable all buttons and edit final message
+                try:
+                    # final text
+                    final_embed = make_embed("🎉 Enjoy VRTEX Economy!", "Enjoy your time with VRTEX Economy — the best economy bot for Discord.", discord.Color.green())
+                    final_embed.set_footer(text="Setup complete. You can edit settings later with `vesettings`.")
+                    for child in self.children:
+                        child.disabled = True
+                    # edit persistent message: replace embed and view (disabled)
+                    if self.message:
+                        await self.message.edit(embed=final_embed, view=self)
+                    await interaction.response.send_message("✅ Setup finished — the economy is ready to use!", ephemeral=True)
+                except Exception:
+                    # if editing fails, still send confirmation
+                    await interaction.response.send_message("✅ Setup finished — the economy is ready to use!", ephemeral=True)
+                self.stop()
+                return
+
+    # send initial message and attach view; capture message object so modal can edit it later
     view = SetupView()
+    # send initial embed and set view.message reference
+    initial_embed = make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin; on next you'll enter currency name & symbol.", accent_color())
     if isinstance(interaction_or_ctx, discord.Interaction):
-        # Interaction was deferred earlier by caller; use followup to send a persistent message
-        await interaction_or_ctx.followup.send(embed=make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin or Edit Currency to set currency now.", accent_color()), view=view)
+        # interaction was deferred earlier by caller (see on_guild_join start_setup that defers)
+        sent = await interaction_or_ctx.followup.send(embed=initial_embed, view=view)
     else:
-        await interaction_or_ctx.send(embed=make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin or Edit Currency to set currency now.", accent_color()), view=view)
+        sent = await interaction_or_ctx.send(embed=initial_embed, view=view)
+    # store message in view so modals can edit it
+    view.message = sent
+    # make sure embed matches the first page precisely
+    await view.update_message_embed()
 
 # wrapper command to start setup manually
 @bot.command()
@@ -319,55 +377,7 @@ async def veletsgo(ctx):
     if not (ctx.author.guild_permissions.manage_guild or ctx.author.id in TEAM_IDS or ctx.author.id == OWNER_ID):
         await ctx.send("You need Manage Server permission (or be owner/team) to run setup.")
         return
-    # For manual invocation we create the SetupView and send it (no defer)
-    class ManualSetupView(View):
-        def __init__(self, *, timeout=900):
-            super().__init__(timeout=timeout)
-            self.page = 1
-            self.guild = ctx.guild
-            self.starter = ctx.author
-
-        async def send_page(self, interaction: discord.Interaction):
-            econ = get_guild_economy(self.guild.id)
-            if self.page == 1:
-                embed = make_embed("SETUP VRTEX ECONOMY — Step 1/3", None, accent_color())
-                embed.add_field(name="Currency", value=f"Name: **{econ.get('currency_name','Coins')}**\nSymbol: **{econ.get('currency_symbol','$')}**", inline=False)
-                await interaction.response.edit_message(embed=embed, view=self)
-            elif self.page == 2:
-                embed = make_embed("SETUP VRTEX ECONOMY — Step 2/3", None, accent_color())
-                embed.add_field(name="Economy Options", value=f"Starting balance: **{econ.get('starting_balance',0)}**", inline=False)
-                await interaction.response.edit_message(embed=embed, view=self)
-            else:
-                embed = make_embed("SETUP VRTEX ECONOMY — Step 3/3", None, discord.Color.green())
-                await interaction.response.edit_message(embed=embed, view=self)
-
-        @discord.ui.button(label="<< Back", style=discord.ButtonStyle.secondary)
-        async def back(self, interaction: discord.Interaction, button: Button):
-            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
-                return await interaction.response.send_message("Not allowed.", ephemeral=True)
-            if self.page > 1:
-                self.page -= 1
-            await self.send_page(interaction)
-
-        @discord.ui.button(label="Edit Currency", style=discord.ButtonStyle.gray)
-        async def edit_currency(self, interaction: discord.Interaction, button: Button):
-            modal = CurrencyModal(self.guild, self.starter)
-            await interaction.response.send_modal(modal)
-
-        @discord.ui.button(label="Next >>", style=discord.ButtonStyle.primary)
-        async def nxt(self, interaction: discord.Interaction, button: Button):
-            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
-                return await interaction.response.send_message("Not allowed.", ephemeral=True)
-            if self.page < 3:
-                self.page += 1
-                await self.send_page(interaction)
-            else:
-                await interaction.response.send_message("✅ Setup complete!", ephemeral=True)
-                self.stop()
-
-    view = ManualSetupView()
-    # Send initial message
-    await ctx.send(embed=make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin or Edit Currency to set currency now.", accent_color()), view=view)
+    await launch_setup(ctx, ctx.guild, starter=ctx.author)
 
 # -----------------------------
 # Economy / Core commands
@@ -434,7 +444,7 @@ async def vetransfer(ctx, member: discord.Member, amount: int):
         return await ctx.send("❌ You cannot transfer to yourself.")
     sender = await get_user(ctx.author.id)
     receiver = await get_user(member.id)
-    if amount <= 0 or amount > sender.get("wallet", 0):
+    if amount <= 0 or amount > sender.get('wallet', 0):
         return await ctx.send("❌ Invalid transfer amount or insufficient balance.")
     sender['wallet'] -= amount
     receiver['wallet'] = receiver.get('wallet', 0) + amount
@@ -663,7 +673,7 @@ async def show_economy_options(interaction: discord.Interaction, guild: discord.
     async def sel_callback(inter: discord.Interaction):
         choice = select.values[0]
         if choice == "currency":
-            modal = CurrencyModal(guild, inter.user)
+            modal = CurrencyModal(guild, inter.user)  # standalone modal (not setup flow)
             await inter.response.send_modal(modal)
         elif choice == "startbal":
             class StartBalModal(Modal, title="Set Starting Balance"):
