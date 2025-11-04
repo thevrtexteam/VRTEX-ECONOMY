@@ -236,7 +236,7 @@ async def addplus(ctx, member: discord.Member):
     await update_user(member.id, user)
     await ctx.send(f"✅ {member.mention} has been granted **VRTEX+** membership!")
 
-@bot.command(aliases=["removeplus"])
+@bot.command()
 async def removeplus(ctx, member: discord.Member):
     if ctx.author.id not in TEAM_IDS and ctx.author.id != OWNER_ID:
         await ctx.send("❌ Only team members or owner can remove VRTEX+ membership.")
@@ -743,6 +743,7 @@ async def veabout(ctx):
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
 
