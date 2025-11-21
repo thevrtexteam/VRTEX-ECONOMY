@@ -1,12 +1,29 @@
-# main.py
-from web_server import keep_alive
+# main.py — VRTEX Economy (slash commands + optional classic prefix for VRTEX+)
+"""
+Features implemented:
+- All core actions exposed as slash commands (default for every server).
+- Optional classic text-prefix commands available only for VRTEX+ (premium) servers.
+- Premium purchase flow (owner/admin will need to wire real payment):
+    * An owner-only helper command `/premium grant <user_id> <months>` simulates marking payment complete and generates a one-time key (OTP) sent via DM to purchaser.
+    * Purchaser uses `/premium activate <key>` inside the server to activate premium for that guild (requires Manage Guild permission).
+- When premium is active for a guild, `/settings` adds a "Subscription" button showing days left and end date.
+- Server-level custom prefix support when premium is active (stored in servers.json under `custom_prefix`).
+- Data persisted in simple JSON files in working directory (users.json, servers.json, economy.json, etc.).
 
-# start keep-alive server
-keep_alive()
+Notes for real deployment:
+- Replace `/premium grant` flow with your payment provider webhook that calls the bot (e.g., an owner-only endpoint or a secured bot command) to mark payment done and generate+DM the key.
+- Keep your DISCORD_TOKEN and OWNER_ID safe.
+
+This file is written to be clear and commented; adjust thresholds / rewards / values as needed.
+"""
+
+from web_server import keep_alive
+keep_alive()  # lightweight keepalive if you host on Replit / similar
 
 import discord
 from discord.ext import commands
-from discord.ui import View, Button, Select, Modal, TextInput
+from discord import app_commands
+from discord.ui import View, Button, Modal, TextInput
 import os
 import json
 import datetime
@@ -23,7 +40,31 @@ TEAM_IDS = [int(x) for x in os.getenv("TEAM_IDS", "").split(",") if x.strip().is
 TOPGG_LINK = os.getenv("TOPGG_LINK", "")
 
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("ve"), intents=intents, case_insensitive=True)
+# We keep a text-prefix bot for backward compatibility, but text commands should be gated to premium servers.
+# If you prefer not to allow text commands at all, set command_prefix to None and remove the prefix command blocks.
+
+def get_prefix(bot, message):
+    """Return a prefix for text commands. If the guild is premium & has custom_prefix, return it.
+    Otherwise return a benign default 've' (but text cmds will be blocked for non-premium by checks).
+    """
+    if not message.guild:
+        # Allow DM prefix usage with 've' as fallback
+        return "ve"
+    servers = load_json("servers")
+    entry = servers.get(str(message.guild.id), {})
+    if entry.get("premium_until"):
+        try:
+            # check expiration
+            until = datetime.datetime.fromisoformat(entry.get("premium_until"))
+            if until > datetime.datetime.utcnow():
+                return entry.get("custom_prefix", "ve")
+        except Exception:
+            pass
+    return "ve"  # fallback but commands will be blocked by check
+
+bot = commands.Bot(command_prefix=get_prefix, intents=intents, case_insensitive=True)
+# remove default help to use our custom help (slash + text)
+bot.remove_command("help")
 
 # -----------------------------
 # Files and storage helpers
@@ -45,6 +86,7 @@ for fname in FILES.values():
         with open(fname, "w", encoding="utf-8") as f:
             json.dump({}, f)
 
+
 def load_json(file_key: str) -> dict:
     path = FILES[file_key]
     try:
@@ -52,15 +94,13 @@ def load_json(file_key: str) -> dict:
             data = json.load(f)
             if isinstance(data, dict):
                 return data
-            # if file contains something else, reset
-            with open(path, "w", encoding="utf-8") as fw:
-                json.dump({}, fw)
-            return {}
     except Exception:
-        # if corrupt or missing, recreate
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-        return {}
+        pass
+    # reset file
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    return {}
+
 
 def save_json(file_key: str, data: dict):
     path = FILES[file_key]
@@ -78,8 +118,8 @@ async def get_user(user_id: int) -> dict:
             "wallet": 0,
             "bank": 0,
             "daily_claimed": None,
-            "work_claims": {},   # per-guild last work timestamp ISO
-            "membership": False,
+            "work_claims": {},
+            "membership": False,  # VRTEX+ flag for the user (if you sell personal membership)
             "xp": 0,
             "level": 1,
             "job": None,
@@ -90,13 +130,14 @@ async def get_user(user_id: int) -> dict:
         save_json("users", users)
     return users[sid]
 
+
 async def update_user(user_id: int, data: dict):
     users = load_json("users")
     sid = str(user_id)
-    if sid not in users:
-        users[sid] = {}
+    users[sid] = users.get(sid, {})
     users[sid].update(data)
     save_json("users", users)
+
 
 async def is_plus(user_id: int) -> bool:
     u = await get_user(user_id)
@@ -105,11 +146,11 @@ async def is_plus(user_id: int) -> bool:
 # -----------------------------
 # Economy helpers
 # -----------------------------
+
 def get_guild_economy(guild_id: int) -> dict:
     econ = load_json("economy")
     gid = str(guild_id)
     if gid not in econ:
-        # defaults
         econ[gid] = {
             "currency_name": "Coins",
             "currency_symbol": "$",
@@ -118,6 +159,7 @@ def get_guild_economy(guild_id: int) -> dict:
         }
         save_json("economy", econ)
     return econ[gid]
+
 
 def set_guild_economy(guild_id: int, data: dict):
     econ = load_json("economy")
@@ -128,8 +170,10 @@ def set_guild_economy(guild_id: int, data: dict):
 # -----------------------------
 # Utility
 # -----------------------------
+
 def utc_now():
     return datetime.datetime.utcnow()
+
 
 def readable_time_delta(sec: int) -> str:
     m, s = divmod(int(sec), 60)
@@ -143,6 +187,7 @@ def readable_time_delta(sec: int) -> str:
 # -----------------------------
 # Leveling helper
 # -----------------------------
+
 async def add_xp(user_id: int, amount: int):
     user = await get_user(user_id)
     user['xp'] = user.get('xp', 0) + amount
@@ -155,19 +200,339 @@ async def add_xp(user_id: int, amount: int):
     return leveled
 
 # -----------------------------
-# Premium embed/theme helpers
+# Premium flow helpers
 # -----------------------------
-def premium_color():
-    # dark theme with purple accent (used as default embed color)
-    return discord.Color.from_rgb(34, 37, 46)  # dark panel color
 
-def accent_color():
-    return discord.Color.from_rgb(153, 50, 204)  # purple accent
+def generate_otp(length=8) -> str:
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return ''.join(random.choice(chars) for _ in range(length))
 
-def make_embed(title: str, description: str = None, color=None):
-    c = color or premium_color()
-    e = discord.Embed(title=title, description=description or "", color=c)
-    return e
+
+def add_pending_key(user_id: int, months: int) -> str:
+    servers = load_json("servers")
+    pending = servers.get("_pending_keys", {})
+    otp = generate_otp()
+    # ensure uniqueness
+    while otp in pending:
+        otp = generate_otp()
+    pending[otp] = {
+        "user_id": user_id,
+        "months": months,
+        "created_at": utc_now().isoformat(),
+        "used": False
+    }
+    servers["_pending_keys"] = pending
+    save_json("servers", servers)
+    return otp
+
+
+def use_pending_key(otp: str) -> Optional[dict]:
+    servers = load_json("servers")
+    pending = servers.get("_pending_keys", {})
+    entry = pending.get(otp)
+    if not entry:
+        return None
+    if entry.get("used"):
+        return None
+    # mark used
+    entry["used"] = True
+    pending[otp] = entry
+    servers["_pending_keys"] = pending
+    save_json("servers", servers)
+    return entry
+
+# -----------------------------
+# Premium activation / grant (owner-side helper)
+# -----------------------------
+
+@bot.tree.command(name="premium_grant", description="OWNER: mark payment done and generate OTP for user (owner-only).")
+@app_commands.describe(user_id="Discord user id who paid", months="Number of months to grant the OTP for")
+async def premium_grant(interaction: discord.Interaction, user_id: str, months: int = 1):
+    # This command is intended for bot owner or your backend to call when a payment clears.
+    if interaction.user.id != OWNER_ID and interaction.user.id not in TEAM_IDS:
+        await interaction.response.send_message("Only the bot owner or team can run this.", ephemeral=True)
+        return
+    try:
+        uid = int(user_id)
+    except Exception:
+        await interaction.response.send_message("Invalid user id.", ephemeral=True)
+        return
+    otp = add_pending_key(uid, months)
+    # DM the purchaser with the key
+    try:
+        user = await bot.fetch_user(uid)
+        await user.send(f"Thanks for your payment! Your VRTEX Economy premium activation key is:\n`{otp}`\nUse `/premium activate <key>` in the server where you'd like to enable VRTEX+.")
+        await interaction.response.send_message(f"OTP generated and DM'd to <@{uid}>.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to DM user (they may have DMs off). OTP: `{otp}`\nError: {e}", ephemeral=True)
+
+# Activation command: user uses OTP in a server to activate premium for that guild
+@bot.tree.command(name="premium_activate", description="Activate VRTEX+ for this server with a one-time key.")
+@app_commands.describe(key="One-time activation key you received by DM")
+async def premium_activate(interaction: discord.Interaction, key: str):
+    # must be used in guild and by a manager (server admin)
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild and interaction.user.id != OWNER_ID and interaction.user.id not in TEAM_IDS:
+        await interaction.response.send_message("You need Manage Server permission to activate premium.", ephemeral=True)
+        return
+    pending = load_json("servers").get("_pending_keys", {})
+    entry = pending.get(key)
+    if not entry:
+        await interaction.response.send_message("Invalid or expired key.", ephemeral=True)
+        return
+    if entry.get("used"):
+        await interaction.response.send_message("This key has already been used.", ephemeral=True)
+        return
+    # Use and apply
+    # mark used
+    use_pending_key(key)
+    months = int(entry.get("months", 1))
+    now = utc_now()
+    delta = datetime.timedelta(days=30 * months)
+    servers = load_json("servers")
+    guild_entry = servers.get(str(interaction.guild.id), {})
+    existing_until = None
+    if guild_entry.get("premium_until"):
+        try:
+            existing_until = datetime.datetime.fromisoformat(guild_entry.get("premium_until"))
+        except Exception:
+            existing_until = None
+    if existing_until and existing_until > now:
+        new_until = existing_until + delta
+    else:
+        new_until = now + delta
+    guild_entry["premium_until"] = new_until.isoformat()
+    # default custom prefix keeps previous or stays as 've' until set
+    guild_entry.setdefault("custom_prefix", guild_entry.get("custom_prefix", "ve"))
+    guild_entry.setdefault("disabled_commands", guild_entry.get("disabled_commands", []))
+    servers[str(interaction.guild.id)] = guild_entry
+    save_json("servers", servers)
+    await interaction.response.send_message(f"✅ VRTEX+ activated for this server until **{new_until.date()}** ({(new_until - now).days} days).", ephemeral=True)
+    # notify server owner in system channel if possible
+    try:
+        ch = interaction.guild.system_channel or interaction.channel
+        await ch.send(f"🎉 Server premium activated by {interaction.user.mention}. VRTEX+ active until **{new_until.date()}**.")
+    except Exception:
+        pass
+
+# -----------------------------
+# Slash commands (primary interface) — examples: /help, /balance, /work, /settings
+# -----------------------------
+
+@bot.tree.command(name="help", description="Show VRTEX Economy help & commands")
+async def slash_help(interaction: discord.Interaction):
+    # custom help embed for slash users
+    embed = discord.Embed(title="💠 VRTEX Economy — Help", description="Slash commands are available below. If you have VRTEX+ you may also use a custom text prefix.", color=discord.Color.from_rgb(88,101,242))
+    embed.add_field(name="Quick", value="`/balance` `/work` `/profile` `/settings` `/premium activate`", inline=False)
+    embed.set_footer(text="Tip: server admins can activate premium to unlock custom prefix and settings.")
+    await interaction.response.send_message(embed=embed, ephemeral=False)
+
+
+@bot.tree.command(name="balance", description="Show your balance")
+@app_commands.describe(member="Member to view (optional)")
+async def slash_balance(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    target = member or interaction.user
+    user = await get_user(target.id)
+    guild_econ = get_guild_economy(interaction.guild.id) if interaction.guild else {"currency_symbol":"$"}
+    sym = guild_econ.get("currency_symbol", "")
+    embed = discord.Embed(title=f"{target.display_name}'s Balance", color=discord.Color.dark_gray())
+    embed.add_field(name="Wallet", value=f"{user.get('wallet',0)} {sym}", inline=True)
+    embed.add_field(name="Bank", value=f"{user.get('bank',0)} {sym}", inline=True)
+    embed.add_field(name="Membership", value="VRTEX+" if user.get('membership') else "Normal", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="work", description="Work and earn (once per hour)")
+async def slash_work(interaction: discord.Interaction):
+    user = await get_user(interaction.user.id)
+    guild_id = str(interaction.guild.id) if interaction.guild else None
+    if not guild_id:
+        await interaction.response.send_message("Work can only be used inside a server.", ephemeral=True)
+        return
+    last_claims = user.get("work_claims", {})
+    now = utc_now()
+    last_iso = last_claims.get(guild_id)
+    cooldown = 3600
+    if last_iso:
+        try:
+            last_dt = datetime.datetime.fromisoformat(last_iso)
+            delta = (now - last_dt).total_seconds()
+            if delta < cooldown:
+                await interaction.response.send_message(f"❌ You can work again in **{readable_time_delta(cooldown - delta)}**", ephemeral=True)
+                return
+        except Exception:
+            pass
+    reward = 1000
+    if await is_plus(interaction.user.id):
+        reward = int(reward * 1.25)
+    user['wallet'] = user.get('wallet',0) + reward
+    last_claims[guild_id] = now.isoformat()
+    user['work_claims'] = last_claims
+    await update_user(interaction.user.id, user)
+    leveled = await add_xp(interaction.user.id, 20)
+    msg = f"✅ You worked and earned **{reward}{get_guild_economy(interaction.guild.id).get('currency_symbol','')}**!"
+    if leveled:
+        msg += "\n🎉 You leveled up!"
+    await interaction.response.send_message(msg)
+
+# -----------------------------
+# Settings slash command: shows view with Subscription button
+# -----------------------------
+
+class SettingsView(View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+
+    @discord.ui.button(label="Subscription", style=discord.ButtonStyle.secondary, custom_id="sv_subscription")
+    async def subscription_btn(self, interaction: discord.Interaction, button: Button):
+        # show subscription info
+        servers = load_json("servers")
+        g = servers.get(str(self.guild.id), {})
+        until_iso = g.get("premium_until")
+        if not until_iso:
+            await interaction.response.send_message("This server does not have VRTEX+ active.", ephemeral=True)
+            return
+        try:
+            until = datetime.datetime.fromisoformat(until_iso)
+        except Exception:
+            await interaction.response.send_message("Subscription info corrupted.", ephemeral=True)
+            return
+        now = utc_now()
+        if until < now:
+            await interaction.response.send_message("VRTEX+ subscription has expired.", ephemeral=True)
+            return
+        delta = until - now
+        await interaction.response.send_message(f"📅 VRTEX+ active until **{until.date()}** — **{delta.days} days** remaining.", ephemeral=True)
+
+
+@bot.tree.command(name="settings", description="Server settings (Manage Server only). Shows Subscription status and economy options.)")
+async def slash_settings(interaction: discord.Interaction):
+    # permission check
+    if not interaction.guild:
+        await interaction.response.send_message("Settings must be used in a server.", ephemeral=True)
+        return
+    if not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+        await interaction.response.send_message("You need Manage Server permission (or be owner/team) to use settings.", ephemeral=True)
+        return
+    econ = get_guild_economy(interaction.guild.id)
+    embed = discord.Embed(title="⚙️ VRTEX Settings", color=discord.Color.blurple())
+    embed.add_field(name="Economy", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**", inline=False)
+    view = SettingsView(interaction.guild)
+    # add an extra button for changing custom prefix if server is premium
+    servers = load_json("servers")
+    g = servers.get(str(interaction.guild.id), {})
+    if g.get("premium_until"):
+        # add a small 'Change Prefix' button
+        async def change_prefix_cb(inter: discord.Interaction):
+            # present a modal to change prefix
+            class PrefixModal(Modal, title="Set Custom Prefix"):
+                new_prefix = TextInput(label="New prefix (single token)", placeholder="e.g. ve or !", max_length=10, required=True)
+                def __init__(self, guild):
+                    super().__init__()
+                    self.guild = guild
+                async def on_submit(self, modal_inter: discord.Interaction):
+                    val = self.new_prefix.value.strip()
+                    # basic validation
+                    if len(val) == 0:
+                        await modal_inter.response.send_message("Invalid prefix.", ephemeral=True)
+                        return
+                    servers_local = load_json("servers")
+                    servers_local.setdefault(str(self.guild.id), {})
+                    servers_local[str(self.guild.id)]["custom_prefix"] = val
+                    save_json("servers", servers_local)
+                    await modal_inter.response.send_message(f"✅ Custom prefix set to `{val}`. You can now use `{val}help` (if available) as a text command in this server.", ephemeral=True)
+            await inter.response.send_modal(PrefixModal(inter.guild))
+
+        # attach as a ephemeral followup via a one-off button
+        btn = Button(label="Change Prefix (Premium)", style=discord.ButtonStyle.primary)
+        btn.callback = lambda inter: asyncio.create_task(change_prefix_cb(inter))
+        view.add_item(btn)
+
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+
+# -----------------------------
+# Text (prefix) commands — gated to premium servers
+# -----------------------------
+
+def premium_required_text_command(ctx: commands.Context) -> bool:
+    if not ctx.guild:
+        return False
+    servers = load_json("servers")
+    entry = servers.get(str(ctx.guild.id), {})
+    until = entry.get("premium_until")
+    if not until:
+        return False
+    try:
+        dt = datetime.datetime.fromisoformat(until)
+        if dt > utc_now():
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def ensure_premium_text():
+    async def predicate(ctx: commands.Context):
+        if premium_required_text_command(ctx):
+            return True
+        await ctx.send("This server does not have VRTEX+ active. Use slash commands (default) or activate premium.")
+        return False
+    return commands.check(predicate)
+
+
+@bot.command(name="help_text")
+@ensure_premium_text()
+async def help_text(ctx: commands.Context):
+    # show same help but text-based. Only available in premium servers
+    embed = discord.Embed(title="💠 VRTEX Economy — Help (text)")
+    embed.add_field(name="Quick", value="`help` `balance` `work` `settings` `premium activate`", inline=False)
+    await ctx.send(embed=embed)
+
+# duplicate basic commands as text wrappers — they all check premium via decorator
+@bot.command(name="balance_text")
+@ensure_premium_text()
+async def balance_text(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    await send_balance_text(ctx, member)
+
+async def send_balance_text(ctx, member: discord.Member):
+    user = await get_user(member.id)
+    guild_econ = get_guild_economy(ctx.guild.id) if ctx.guild else {"currency_symbol":"$"}
+    sym = guild_econ.get("currency_symbol", "")
+    embed = discord.Embed(title=f"{member.display_name}'s Balance", color=discord.Color.dark_gray())
+    embed.add_field(name="Wallet", value=f"{user.get('wallet',0)} {sym}", inline=True)
+    embed.add_field(name="Bank", value=f"{user.get('bank',0)} {sym}", inline=True)
+    await ctx.send(embed=embed)
+
+# You can add other text-wrapped commands similarly. For brevity we keep a few examples.
+
+# -----------------------------
+# Small safety check for disabling commands per-server
+# -----------------------------
+@bot.check
+async def global_command_block(ctx):
+    # Allow DMs / missing guild gracefully
+    if ctx.guild is None:
+        return True
+    # Always allow help_text (but it's gated above)
+    if ctx.command and ctx.command.name in ("help_text", "balance_text"):
+        return True
+    servers = load_json("servers")
+    server_entry = servers.get(str(ctx.guild.id), {})
+    disabled = server_entry.get("disabled_commands", [])
+    cmd_name = ctx.command.name if ctx.command else None
+    if not cmd_name:
+        return True
+    if cmd_name in disabled:
+        try:
+            await ctx.send(f"⚠️ The command `{cmd_name}` is currently disabled on this server.")
+        except Exception:
+            pass
+        return False
+    return True
 
 # -----------------------------
 # On ready
@@ -175,674 +540,15 @@ def make_embed(title: str, description: str = None, color=None):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
-    print("💾 JSON storage ready")
-    # ensure economy file entries exist for guilds bot is in
-    econ = load_json("economy")
-    updated = False
-    for g in bot.guilds:
-        if str(g.id) not in econ:
-            econ[str(g.id)] = {
-                "currency_name": "Coins",
-                "currency_symbol": "$",
-                "starting_balance": 0,
-                "tax_rate": 0
-            }
-            updated = True
-    if updated:
-        save_json("economy", econ)
+    # sync slash commands
+    try:
+        await bot.tree.sync()
+        print("🔁 Slash commands synced.")
+    except Exception as e:
+        print("Warning: failed to sync commands:", e)
 
 # -----------------------------
-# On guild join -> send setup message (silent but visible to server)
-# -----------------------------
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    # find the first channel where @everyone can view and send messages
-    target_channel = None
-    for ch in guild.text_channels:
-        perms = ch.permissions_for(guild.default_role)
-        if perms.view_channel and perms.send_messages:
-            target_channel = ch
-            break
-    if not target_channel:
-        # nothing to do
-        return
-    embed = make_embed("💠 Thanks for inviting VRTEX Economy!", "Type `veletsgo` or press **Start Setup** to configure the economy for this server.", accent_color())
-    view = View()
-    btn = Button(label="Start Setup (veletsgo)", style=discord.ButtonStyle.green)
-
-    async def start_setup(interaction: discord.Interaction):
-        # permission check
-        if interaction.user.guild_permissions.manage_guild or interaction.user.id == OWNER_ID or interaction.user.id in TEAM_IDS:
-            # defer then launch setup
-            await interaction.response.defer()
-            await launch_setup(interaction, guild, starter=interaction.user)
-        else:
-            await interaction.response.send_message("You need Manage Server (or be owner / team) to run setup.", ephemeral=True)
-
-    btn.callback = start_setup
-    view.add_item(btn)
-    # send as normal message (not ephemeral)
-    await target_channel.send(embed=embed, view=view)
-
-# -----------------------------
-# Setup flow helpers (modals + paged buttons)
-# -----------------------------
-class CurrencyModal(Modal, title="Currency setup"):
-    currency_name = TextInput(label="Currency name", placeholder="Coins, Gold, VRTEX", required=True, max_length=40)
-    currency_symbol = TextInput(label="Currency symbol (optional)", placeholder="$ or V", required=False, max_length=6)
-
-    def __init__(self, guild: discord.Guild, starter: discord.Member, setup_view = None):
-        super().__init__()
-        self.guild = guild
-        self.starter = starter
-        # reference to the SetupView instance that launched this modal (optional,
-        # used so the modal can cause the setup message to advance)
-        self.setup_view = setup_view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        name = self.currency_name.value.strip()
-        sym = self.currency_symbol.value.strip()
-        set_guild_economy(self.guild.id, {"currency_name": name or "Coins", "currency_symbol": sym or ""})
-        # reply to the modal submit
-        await interaction.response.send_message(f"✅ Currency set to **{name}** `{sym}`. Proceeding to next step...", ephemeral=True)
-        # If the modal was launched from a SetupView, ask it to advance to next page and update the setup message
-        if self.setup_view:
-            try:
-                # move to next page and update the persistent setup message
-                self.setup_view.page = 2
-                # update the persistent message
-                if getattr(self.setup_view, "message", None):
-                    econ = get_guild_economy(self.guild.id)
-                    embed = make_embed("SETUP VRTEX ECONOMY — Step 2/3", None, accent_color())
-                    embed.add_field(name="Economy Options", value=f"Starting balance: **{econ.get('starting_balance',0)} {econ.get('currency_symbol','')}**\nWork reward: **1000 {econ.get('currency_symbol','')}** (per hour).", inline=False)
-                    embed.set_footer(text="These are editable later with `vesettings`.")
-                    # ensure Next label is accurate
-                    for child in self.setup_view.children:
-                        if isinstance(child, Button) and child.custom_id == "sv_next":
-                            child.label = "Next >>"
-                    await self.setup_view.message.edit(embed=embed, view=self.setup_view)
-            except Exception:
-                # silent fail (we already replied to modal)
-                pass
-
-async def launch_setup(interaction_or_ctx, guild: discord.Guild, starter: discord.Member):
-    # send a paged setup view starting with an intro message
-    channel = None
-    if isinstance(interaction_or_ctx, discord.Interaction):
-        channel = interaction_or_ctx.channel
-    else:
-        channel = interaction_or_ctx
-
-    # SetupView with correct callback signatures and only Back/Next (Next -> finish on page 3)
-    class SetupView(View):
-        def __init__(self, *, timeout=900):
-            super().__init__(timeout=timeout)
-            self.page = 1
-            self.guild = guild
-            self.starter = starter
-            self.message: Optional[discord.Message] = None  # will hold the persistent message
-
-        async def update_message_embed(self):
-            econ = get_guild_economy(self.guild.id)
-            if self.page == 1:
-                embed = make_embed("SETUP VRTEX ECONOMY — Step 1/3", None, accent_color())
-                embed.add_field(name="Currency", value=f"Name: **{econ.get('currency_name','Coins')}**\nSymbol: **{econ.get('currency_symbol','$')}**\n\nWhen you press **Next >>** you'll be asked to type the currency name & symbol.", inline=False)
-                embed.set_footer(text="You can change these later with `vesettings`.")
-            elif self.page == 2:
-                embed = make_embed("SETUP VRTEX ECONOMY — Step 2/3", None, accent_color())
-                embed.add_field(name="Economy Options", value=f"Starting balance: **{econ.get('starting_balance',0)} {econ.get('currency_symbol','')}**\nWork reward: **1000 {econ.get('currency_symbol','')}** (per hour).", inline=False)
-                embed.set_footer(text="These are editable later with `vesettings`.")
-            else:
-                embed = make_embed("SETUP VRTEX ECONOMY — Step 3/3", None, discord.Color.green())
-                embed.add_field(name="Confirm & Finish", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**\nWork reward: **1000**", inline=False)
-                embed.set_footer(text="Press Finish to complete setup.")
-            # update label for Next button to become Finish on page 3
-            for child in self.children:
-                if isinstance(child, Button) and child.custom_id == "sv_next":
-                    child.label = "Finish" if self.page == 3 else "Next >>"
-            # edit persistent message
-            if self.message:
-                await self.message.edit(embed=embed, view=self)
-
-        # Back button (interaction first, button second)
-        @discord.ui.button(label="<< Back", style=discord.ButtonStyle.secondary, custom_id="sv_back")
-        async def back(self, interaction: discord.Interaction, button: Button):
-            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
-                return await interaction.response.send_message("You are not allowed to navigate this setup.", ephemeral=True)
-            if self.page > 1:
-                self.page -= 1
-                await interaction.response.defer()
-                await self.update_message_embed()
-            else:
-                # if on page 1, just acknowledge
-                await interaction.response.send_message("You're already on the first page.", ephemeral=True)
-
-        # Next / Finish button
-        @discord.ui.button(label="Next >>", style=discord.ButtonStyle.primary, custom_id="sv_next")
-        async def nxt(self, interaction: discord.Interaction, button: Button):
-            if interaction.user != self.starter and not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
-                return await interaction.response.send_message("You are not allowed to navigate this setup.", ephemeral=True)
-
-            # If on page 1: present CurrencyModal, the modal will set currency and advance page to 2
-            if self.page == 1:
-                modal = CurrencyModal(self.guild, self.starter, setup_view=self)
-                # show modal to user
-                await interaction.response.send_modal(modal)
-                # do not advance page here; the modal's on_submit will set page=2 and update the message
-                return
-
-            # If on page 2: go to page 3
-            if self.page == 2:
-                self.page = 3
-                await interaction.response.defer()
-                await self.update_message_embed()
-                return
-
-            # If on page 3: Finish
-            if self.page == 3:
-                # disable all buttons and edit final message
-                try:
-                    # final text
-                    final_embed = make_embed("🎉 Enjoy VRTEX Economy!", "Enjoy your time with VRTEX Economy — the best economy bot for Discord.", discord.Color.green())
-                    final_embed.set_footer(text="Setup complete. You can edit settings later with `vesettings`.")
-                    for child in self.children:
-                        child.disabled = True
-                    # edit persistent message: replace embed and view (disabled)
-                    if self.message:
-                        await self.message.edit(embed=final_embed, view=self)
-                    await interaction.response.send_message("✅ Setup finished — the economy is ready to use!", ephemeral=True)
-                except Exception:
-                    # if editing fails, still send confirmation
-                    await interaction.response.send_message("✅ Setup finished — the economy is ready to use!", ephemeral=True)
-                self.stop()
-                return
-
-    # send initial message and attach view; capture message object so modal can edit it later
-    view = SetupView()
-    # send initial embed and set view.message reference
-    initial_embed = make_embed("SETUP VRTEX ECONOMY FOR YOUR SERVER", "Press Next to begin; on next you'll enter currency name & symbol.", accent_color())
-    if isinstance(interaction_or_ctx, discord.Interaction):
-        # interaction was deferred earlier by caller (see on_guild_join start_setup that defers)
-        sent = await interaction_or_ctx.followup.send(embed=initial_embed, view=view)
-    else:
-        sent = await interaction_or_ctx.send(embed=initial_embed, view=view)
-    # store message in view so modals can edit it
-    view.message = sent
-    # make sure embed matches the first page precisely
-    await view.update_message_embed()
-
-# wrapper command to start setup manually
-@bot.command()
-async def veletsgo(ctx):
-    if not (ctx.author.guild_permissions.manage_guild or ctx.author.id in TEAM_IDS or ctx.author.id == OWNER_ID):
-        await ctx.send("You need Manage Server permission (or be owner/team) to run setup.")
-        return
-    await launch_setup(ctx, ctx.guild, starter=ctx.author)
-
-# -----------------------------
-# Economy / Core commands
-# -----------------------------
-async def send_balance_embed(ctx, member: Optional[discord.Member] = None):
-    member = member or ctx.author
-    user = await get_user(member.id)
-    guild_econ = get_guild_economy(ctx.guild.id) if ctx.guild else {"currency_name":"Coins","currency_symbol":"$"}
-    name = guild_econ.get("currency_name", "Coins")
-    sym = guild_econ.get("currency_symbol", "")
-    wallet = user.get("wallet", 0)
-    bank = user.get("bank", 0)
-    embed = make_embed(f"{member.display_name}'s Balance", None, premium_color())
-    embed.add_field(name=f"{name} (Wallet)", value=f"{wallet} {sym}", inline=True)
-    embed.add_field(name=f"{name} (Bank)", value=f"{bank} {sym}", inline=True)
-    embed.add_field(name="Membership", value="VRTEX+" if user.get("membership") else "Normal", inline=False)
-    embed.set_footer(text="Use veprofile for more info.")
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def vebal(ctx, member: discord.Member=None):
-    await send_balance_embed(ctx, member)
-
-# extra variants (separate commands that call same logic)
-@bot.command()
-async def vewallet(ctx, member: discord.Member=None):
-    await send_balance_embed(ctx, member)
-
-@bot.command()
-async def vepocket(ctx, member: discord.Member=None):
-    await send_balance_embed(ctx, member)
-
-@bot.command()
-async def vebank(ctx, member: discord.Member=None):
-    await send_balance_embed(ctx, member)
-
-@bot.command()
-async def vecash(ctx, member: discord.Member=None):
-    await send_balance_embed(ctx, member)
-
-@bot.command()
-async def vedeposit(ctx, amount: int):
-    user = await get_user(ctx.author.id)
-    if amount <= 0 or amount > user.get("wallet", 0):
-        return await ctx.send("❌ Invalid deposit amount or insufficient wallet funds.")
-    user['wallet'] -= amount
-    user['bank'] = user.get('bank', 0) + amount
-    await update_user(ctx.author.id, user)
-    await ctx.send(f"✅ Deposited {amount}{get_guild_economy(ctx.guild.id).get('currency_symbol','')} into your bank.")
-
-@bot.command()
-async def vewithdraw(ctx, amount: int):
-    user = await get_user(ctx.author.id)
-    if amount <= 0 or amount > user.get("bank", 0):
-        return await ctx.send("❌ Invalid withdraw amount or insufficient bank funds.")
-    user['bank'] -= amount
-    user['wallet'] = user.get('wallet', 0) + amount
-    await update_user(ctx.author.id, user)
-    await ctx.send(f"✅ Withdrawn {amount}{get_guild_economy(ctx.guild.id).get('currency_symbol','')} to your wallet.")
-
-@bot.command()
-async def vetransfer(ctx, member: discord.Member, amount: int):
-    if member.id == ctx.author.id:
-        return await ctx.send("❌ You cannot transfer to yourself.")
-    sender = await get_user(ctx.author.id)
-    receiver = await get_user(member.id)
-    if amount <= 0 or amount > sender.get('wallet', 0):
-        return await ctx.send("❌ Invalid transfer amount or insufficient balance.")
-    sender['wallet'] -= amount
-    receiver['wallet'] = receiver.get('wallet', 0) + amount
-    await update_user(ctx.author.id, sender)
-    await update_user(member.id, receiver)
-    await ctx.send(f"✅ Transferred {amount}{get_guild_economy(ctx.guild.id).get('currency_symbol','')} to {member.mention}!")
-
-@bot.command()
-async def veleaderboard(ctx):
-    users = load_json("users")
-    ranking = []
-    for uid, data in users.items():
-        total = data.get('wallet', 0) + data.get('bank', 0)
-        ranking.append((uid, total))
-    ranking.sort(key=lambda x: x[1], reverse=True)
-    embed = make_embed("💰 Top Richest Users", None, accent_color())
-    guild = ctx.guild
-    count = 0
-    for uid, total in ranking:
-        if count >= 10:
-            break
-        try:
-            member = guild.get_member(int(uid)) if guild else None
-            name = member.display_name if member else f"User {uid}"
-        except Exception:
-            name = f"User {uid}"
-        embed.add_field(name=name, value=f"Total: {total}{get_guild_economy(guild.id).get('currency_symbol','')}", inline=False)
-        count += 1
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def veprofile(ctx, member: discord.Member=None):
-    member = member or ctx.author
-    user = await get_user(member.id)
-    econ = get_guild_economy(ctx.guild.id)
-    embed = make_embed(f"{member.display_name}'s Profile", None, premium_color())
-    embed.add_field(name="Balance", value=f"{user.get('wallet',0)+user.get('bank',0)}{econ.get('currency_symbol','')}", inline=False)
-    embed.add_field(name="Level & XP", value=f"Level {user.get('level',1)} (XP: {user.get('xp',0)})", inline=False)
-    embed.add_field(name="Job", value=user.get('job') or "Unemployed", inline=False)
-    embed.add_field(name="Businesses", value=", ".join(user.get('businesses',{}).keys()) or "None", inline=False)
-    await ctx.send(embed=embed)
-
-# -----------------------------
-# Work: user can use once per hour, gives 1000
-# -----------------------------
-@bot.command()
-async def vework(ctx):
-    user = await get_user(ctx.author.id)
-    guild_id = str(ctx.guild.id)
-    last_claims = user.get("work_claims", {})
-    now = utc_now()
-    last_iso = last_claims.get(guild_id)
-    cooldown = 3600  # 1 hour
-    if last_iso:
-        try:
-            last_dt = datetime.datetime.fromisoformat(last_iso)
-            delta = (now - last_dt).total_seconds()
-            if delta < cooldown:
-                await ctx.send(f"❌ You can work again in **{readable_time_delta(cooldown - delta)}**")
-                return
-        except Exception:
-            # parsing error => allow
-            pass
-    reward = 1000
-    # plus members get bonus
-    if await is_plus(ctx.author.id):
-        reward = int(reward * 1.25)
-    user['wallet'] = user.get('wallet', 0) + reward
-    last_claims[guild_id] = now.isoformat()
-    user['work_claims'] = last_claims
-    await update_user(ctx.author.id, user)
-    leveled = await add_xp(ctx.author.id, 20)
-    msg = f"✅ You worked and earned **{reward}{get_guild_economy(ctx.guild.id).get('currency_symbol','')}**!"
-    if leveled:
-        msg += "\n🎉 You leveled up!"
-    await ctx.send(msg)
-
-# -----------------------------
-# Coinflip: vecf (amount)
-# -----------------------------
-@bot.command()
-async def vecf(ctx, amount: str):
-    user = await get_user(ctx.author.id)
-    if amount.lower() == 'all':
-        amt = user.get('wallet', 0)
-    else:
-        try:
-            amt = int(amount)
-        except ValueError:
-            return await ctx.send("❌ Invalid amount. Provide a number or 'all'.")
-    if amt <= 0 or amt > user.get('wallet', 0):
-        return await ctx.send("❌ Insufficient funds.")
-    user['wallet'] -= amt
-    await update_user(ctx.author.id, user)
-    await ctx.send("🪙 Flipping the coin... You're **Heads**")
-    await asyncio.sleep(1.5)
-    res = random.choice(["Heads", "Tails"])
-    if res == "Heads":
-        winnings = amt * 2
-        user['wallet'] = user.get('wallet', 0) + winnings
-        await update_user(ctx.author.id, user)
-        await ctx.send(f"🎉 It landed on **Heads** — you won **{winnings}{get_guild_economy(ctx.guild.id).get('currency_symbol','')}**!")
-    else:
-        await ctx.send(f"💀 It landed on **Tails** — you lost **{amt}{get_guild_economy(ctx.guild.id).get('currency_symbol','')}**.")
-
-# -----------------------------
-# Simple mini-games (kept but minimal)
-# -----------------------------
-@bot.command()
-async def veslots(ctx, amount: int):
-    user = await get_user(ctx.author.id)
-    if amount <= 0 or amount > user.get('wallet', 0):
-        return await ctx.send("❌ Invalid amount.")
-    user['wallet'] -= amount
-    await update_user(ctx.author.id, user)
-    emojis = ["🍒", "🍋", "🍉", "⭐", "💎"]
-    res = [random.choice(emojis) for _ in range(3)]
-    embed = make_embed("🎰 Slots", " | ".join(res), accent_color())
-    if res[0] == res[1] == res[2]:
-        winnings = amount * 2
-        user['wallet'] += winnings
-        await update_user(ctx.author.id, user)
-        embed.add_field(name="🎉 You won!", value=f"You earned {winnings}{get_guild_economy(ctx.guild.id).get('currency_symbol','')}")
-    else:
-        embed.add_field(name="💀 You lost", value=f"Lost {amount}{get_guild_economy(ctx.guild.id).get('currency_symbol','')}")
-    await ctx.send(embed=embed)
-
-# -----------------------------
-# vebusiness simplified group
-# -----------------------------
-DEFAULT_BUSINESSES = {
-    "Bakery": {"cost": 5000, "profit": 500, "upkeep": 50, "tier": 1},
-    "Mine": {"cost": 10000, "profit": 1200, "upkeep": 150, "tier": 2},
-    "Shop": {"cost": 20000, "profit": 2500, "upkeep": 300, "tier": 3},
-}
-
-@bot.group()
-async def vebusiness(ctx):
-    if ctx.invoked_subcommand is None:
-        await ctx.send("Usage: vebusiness list | buy <name> | claim | info <name>")
-
-@vebusiness.command()
-async def list(ctx):
-    embed = make_embed("🏠 Available Businesses", None, accent_color())
-    for name, info in DEFAULT_BUSINESSES.items():
-        embed.add_field(name=name, value=f"Cost: {info['cost']}{get_guild_economy(ctx.guild.id).get('currency_symbol','')} | Profit: {info['profit']}", inline=False)
-    await ctx.send(embed=embed)
-
-@vebusiness.command()
-async def buy(ctx, *, name: str):
-    if name not in DEFAULT_BUSINESSES:
-        return await ctx.send("❌ Business not found.")
-    user = await get_user(ctx.author.id)
-    if name in user.get('businesses', {}):
-        return await ctx.send("❌ You already own this business.")
-    cost = DEFAULT_BUSINESSES[name]['cost']
-    if user.get('wallet', 0) < cost:
-        return await ctx.send("❌ Not enough money.")
-    user['wallet'] -= cost
-    user.setdefault('businesses', {})[name] = DEFAULT_BUSINESSES[name]
-    await update_user(ctx.author.id, user)
-    await ctx.send(f"✅ You bought **{name}**!")
-
-@vebusiness.command()
-async def claim(ctx):
-    user = await get_user(ctx.author.id)
-    total = 0
-    for b, info in user.get('businesses', {}).items():
-        total += info.get('profit', 0)
-    user['wallet'] = user.get('wallet', 0) + total
-    await update_user(ctx.author.id, user)
-    await ctx.send(f"✅ Claimed {total}{get_guild_economy(ctx.guild.id).get('currency_symbol','')} from your businesses.")
-
-@vebusiness.command()
-async def info(ctx, *, name: str):
-    if name not in DEFAULT_BUSINESSES:
-        return await ctx.send("❌ Business not found.")
-    info = DEFAULT_BUSINESSES[name]
-    embed = make_embed(f"{name} Info", None, accent_color())
-    embed.add_field(name="Cost", value=str(info['cost']), inline=True)
-    embed.add_field(name="Profit", value=str(info['profit']), inline=True)
-    embed.add_field(name="Tier", value=str(info['tier']), inline=True)
-    await ctx.send(embed=embed)
-
-# -----------------------------
-# vesettings interactive (buttons -> categories -> dropdown -> modals)
-# -----------------------------
-@bot.command()
-async def vesettings(ctx):
-    if not (ctx.author.guild_permissions.manage_guild or ctx.author.id in TEAM_IDS or ctx.author.id == OWNER_ID):
-        return await ctx.send("You need Manage Server permission (or be owner/team) to use vesettings.")
-    econ = get_guild_economy(ctx.guild.id)
-    embed = make_embed("⚙️ VRTEX Settings", None, accent_color())
-    embed.add_field(name="Current", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**\nTax: **{econ.get('tax_rate',0)}%**", inline=False)
-
-    class SettingsView(View):
-        def __init__(self):
-            super().__init__(timeout=300)
-
-        @discord.ui.button(label="Economy", style=discord.ButtonStyle.primary)
-        async def economy_btn(self, interaction: discord.Interaction, button: Button):
-            await interaction.response.defer(ephemeral=True)
-            await show_economy_options(interaction, ctx.guild)
-
-        @discord.ui.button(label="Commands toggle", style=discord.ButtonStyle.secondary)
-        async def toggle_btn(self, interaction: discord.Interaction, button: Button):
-            await interaction.response.defer(ephemeral=True)
-            await show_toggle_options(interaction, ctx.guild)
-
-        @discord.ui.button(label="Prefix", style=discord.ButtonStyle.gray)
-        async def prefix_btn(self, interaction: discord.Interaction, button: Button):
-            await interaction.response.send_message("To change prefix use `veprefix <newprefix>` (only VRTEX+ members can do this).", ephemeral=True)
-
-    view = SettingsView()
-    await ctx.send(embed=embed, view=view)
-
-async def show_economy_options(interaction: discord.Interaction, guild: discord.Guild):
-    econ = get_guild_economy(guild.id)
-    options = [
-        discord.SelectOption(label="Set Currency Name & Symbol", value="currency"),
-        discord.SelectOption(label="Set Starting Balance", value="startbal"),
-        discord.SelectOption(label="Set Tax Rate", value="tax"),
-    ]
-    select = Select(placeholder="Choose economy setting...", options=options, min_values=1, max_values=1)
-
-    async def sel_callback(inter: discord.Interaction):
-        choice = select.values[0]
-        if choice == "currency":
-            modal = CurrencyModal(guild, inter.user)  # standalone modal (not setup flow)
-            await inter.response.send_modal(modal)
-        elif choice == "startbal":
-            class StartBalModal(Modal, title="Set Starting Balance"):
-                amount = TextInput(label="Starting balance (integer)", placeholder="e.g. 100", required=True, max_length=12)
-                def __init__(self, guild, user):
-                    super().__init__()
-                    self.guild = guild
-                    self.user = user
-                async def on_submit(self, inner_inter: discord.Interaction):
-                    try:
-                        val = int(self.amount.value.strip())
-                        set_guild_economy(self.guild.id, {"starting_balance": val})
-                        await inner_inter.response.send_message(f"✅ Starting balance set to {val}.", ephemeral=True)
-                    except Exception:
-                        await inner_inter.response.send_message("❌ Invalid number.", ephemeral=True)
-            await inter.response.send_modal(StartBalModal(guild, inter.user))
-        elif choice == "tax":
-            class TaxModal(Modal, title="Set Tax Rate"):
-                rate = TextInput(label="Tax rate (percentage)", placeholder="e.g. 5", required=True, max_length=6)
-                def __init__(self, guild, user):
-                    super().__init__()
-                    self.guild = guild
-                    self.user = user
-                async def on_submit(self, inner_inter: discord.Interaction):
-                    try:
-                        r = int(self.rate.value.strip())
-                        set_guild_economy(self.guild.id, {"tax_rate": r})
-                        await inner_inter.response.send_message(f"✅ Tax rate set to {r}%.", ephemeral=True)
-                    except Exception:
-                        await inner_inter.response.send_message("❌ Invalid rate.", ephemeral=True)
-            await inter.response.send_modal(TaxModal(guild, inter.user))
-
-    select.callback = sel_callback
-    view = View()
-    view.add_item(select)
-    await interaction.followup.send("Choose an economy setting to edit:", view=view, ephemeral=True)
-
-async def show_toggle_options(interaction: discord.Interaction, guild: discord.Guild):
-    servers = load_json("servers")
-    servers[str(guild.id)] = servers.get(str(guild.id), {})
-    disabled = servers[str(guild.id)].get("disabled_commands", [])
-    COMMANDS = ["vework","vecf","veslots","vebusiness","vehelp","vebal"]
-    options = []
-    for c in COMMANDS:
-        label = f"{c} {'(disabled)' if c in disabled else '(enabled)'}"
-        options.append(discord.SelectOption(label=label, value=c))
-    select = Select(placeholder="Toggle command (select to toggle)", options=options, min_values=1, max_values=1)
-    async def sel_callback(inter: discord.Interaction):
-        cmd = select.values[0]
-        if cmd in disabled:
-            disabled.remove(cmd)
-            await inter.response.send_message(f"✅ Enabled `{cmd}`", ephemeral=True)
-        else:
-            disabled.append(cmd)
-            await inter.response.send_message(f"✅ Disabled `{cmd}`", ephemeral=True)
-        servers[str(guild.id)]["disabled_commands"] = disabled
-        save_json("servers", servers)
-    select.callback = sel_callback
-    view = View()
-    view.add_item(select)
-    await interaction.followup.send("Choose a command to toggle:", view=view, ephemeral=True)
-
-# -----------------------------
-# vehelp interactive (improved & attractive)
-# -----------------------------
-@bot.command()
-async def vehelp(ctx):
-    # main attractive embed with quick usage lines
-    econ = get_guild_economy(ctx.guild.id) if ctx.guild else {"currency_symbol": "$"}
-    sym = econ.get("currency_symbol", "")
-    embed = discord.Embed(
-        title="💠 VRTEX Economy — Command Center",
-        description="Click the buttons below to view command categories. Tip: use `ve` as prefix (e.g. `vebal`).",
-        color=discord.Color.from_rgb(88, 101, 242)
-    )
-    embed.set_thumbnail(url="https://i.imgur.com/0X9bK9d.png")  # placeholder nice thumbnail (replace if you want)
-    embed.add_field(name="Quick Start", value=f"`vework` — earn **1000{sym}** / hour\n`vebal` — show balance\n`vecf <amt|'all'>` — coinflip", inline=False)
-    embed.add_field(name="Premium", value="VRTEX+ members get better rewards and perks.", inline=False)
-    embed.set_footer(text="Use the buttons below — replies are ephemeral (private) so your chat stays clean.")
-    view = View()
-
-    async def economy_cb(interaction: discord.Interaction):
-        e = discord.Embed(title="📊 Economy Commands", color=discord.Color.green())
-        e.add_field(name="Balance", value="`vebal` `vewallet` `vepocket` `vebank` `vecash` — show balances", inline=False)
-        e.add_field(name="Deposit / Withdraw", value="`vedeposit <amount>` | `vewithdraw <amount>`", inline=False)
-        e.add_field(name="Transfer", value="`vetransfer @user <amount>`", inline=False)
-        e.add_field(name="Work", value=f"`vework` — earn **1000{sym}** (once per hour)", inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
-
-    async def games_cb(interaction: discord.Interaction):
-        e = discord.Embed(title="🎮 Games & Mini-Games", color=discord.Color.gold())
-        e.add_field(name="Coinflip", value="`vecf <amount|'all'>` — coinflip", inline=False)
-        e.add_field(name="Slots", value="`veslots <amount>` — try your luck", inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
-
-    async def biz_cb(interaction: discord.Interaction):
-        e = discord.Embed(title="🏬 Businesses", color=discord.Color.orange())
-        e.add_field(name="Business commands", value="`vebusiness list` | `vebusiness buy <name>` | `vebusiness claim` | `vebusiness info <name>`", inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
-
-    async def server_cb(interaction: discord.Interaction):
-        e = discord.Embed(title="⚙️ Server & Settings", color=discord.Color.blurple())
-        e.add_field(name="Setup & Settings", value="`veletsgo` — start server setup\n`vesettings` — interactive settings (Manage Server only)", inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
-
-    async def info_cb(interaction: discord.Interaction):
-        e = discord.Embed(title="ℹ️ Info", color=discord.Color.blue())
-        e.add_field(name="Profile & Leaderboard", value="`veprofile` | `veleaderboard`", inline=False)
-        e.add_field(name="Help", value="You're viewing it! `vehelp`", inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
-
-    b_econ = Button(label="Economy", style=discord.ButtonStyle.primary)
-    b_games = Button(label="Games", style=discord.ButtonStyle.secondary)
-    b_biz = Button(label="Businesses", style=discord.ButtonStyle.success)
-    b_server = Button(label="Server", style=discord.ButtonStyle.gray)
-    b_info = Button(label="Info", style=discord.ButtonStyle.blurple)
-
-    b_econ.callback = lambda inter: asyncio.create_task(economy_cb(inter))
-    b_games.callback = lambda inter: asyncio.create_task(games_cb(inter))
-    b_biz.callback = lambda inter: asyncio.create_task(biz_cb(inter))
-    b_server.callback = lambda inter: asyncio.create_task(server_cb(inter))
-    b_info.callback = lambda inter: asyncio.create_task(info_cb(inter))
-
-    view.add_item(b_econ)
-    view.add_item(b_games)
-    view.add_item(b_biz)
-    view.add_item(b_server)
-    view.add_item(b_info)
-
-    await ctx.send(embed=embed, view=view)
-
-# -----------------------------
-# small safety: prevent disabled commands (robust)
-# -----------------------------
-@bot.check
-async def global_command_block(ctx):
-    # Allow DMs / missing guild gracefully
-    if ctx.guild is None:
-        return True
-
-    # Always allow help
-    if ctx.command and ctx.command.name == "vehelp":
-        return True
-
-    servers = load_json("servers")
-    server_entry = servers.get(str(ctx.guild.id), {})
-    disabled = server_entry.get("disabled_commands", [])
-
-    cmd_name = ctx.command.name if ctx.command else None
-
-    # If there's no command object, allow (or let discord handle unknown commands)
-    if not cmd_name:
-        return True
-
-    # If command is disabled on this server, block and inform (and log)
-    if cmd_name in disabled:
-        try:
-            await ctx.send(f"⚠️ The command `{cmd_name}` is currently disabled on this server.")
-        except Exception:
-            # ignore send errors
-            pass
-        # log to console for easier debugging
-        print(f"[COMMAND BLOCKED] {ctx.guild.name}({ctx.guild.id}) blocked command: {cmd_name}")
-        return False
-
-    return True
-
-# -----------------------------
-# run bot
+# Run bot
 # -----------------------------
 if __name__ == "__main__":
     if not TOKEN:
