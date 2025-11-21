@@ -1,35 +1,19 @@
-# main.py — VRTEX Economy (slash commands + optional classic prefix for VRTEX+)
-"""
-Features implemented:
-- All core actions exposed as slash commands (default for every server).
-- Optional classic text-prefix commands available only for VRTEX+ (premium) servers.
-- Premium purchase flow (owner/admin will need to wire real payment):
-    * An owner-only helper command `/premium grant <user_id> <months>` simulates marking payment complete and generates a one-time key (OTP) sent via DM to purchaser.
-    * Purchaser uses `/premium activate <key>` inside the server to activate premium for that guild (requires Manage Guild permission).
-- When premium is active for a guild, `/settings` adds a "Subscription" button showing days left and end date.
-- Server-level custom prefix support when premium is active (stored in servers.json under `custom_prefix`).
-- Data persisted in simple JSON files in working directory (users.json, servers.json, economy.json, etc.).
-
-Notes for real deployment:
-- Replace `/premium grant` flow with your payment provider webhook that calls the bot (e.g., an owner-only endpoint or a secured bot command) to mark payment done and generate+DM the key.
-- Keep your DISCORD_TOKEN and OWNER_ID safe.
-
-This file is written to be clear and commented; adjust thresholds / rewards / values as needed.
-"""
-
+# main.py
 from web_server import keep_alive
-keep_alive()  # lightweight keepalive if you host on Replit / similar
+
+# start keep-alive server
+keep_alive()
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
-from discord.ui import View, Button, Modal, TextInput
+from discord.ui import View, Button, Select, Modal, TextInput
 import os
 import json
 import datetime
 import random
 import asyncio
-from typing import Optional
+from typing import Optional, List, Dict
 
 # -----------------------------
 # Configuration / Environment
@@ -40,31 +24,8 @@ TEAM_IDS = [int(x) for x in os.getenv("TEAM_IDS", "").split(",") if x.strip().is
 TOPGG_LINK = os.getenv("TOPGG_LINK", "")
 
 intents = discord.Intents.all()
-# We keep a text-prefix bot for backward compatibility, but text commands should be gated to premium servers.
-# If you prefer not to allow text commands at all, set command_prefix to None and remove the prefix command blocks.
-
-def get_prefix(bot, message):
-    """Return a prefix for text commands. If the guild is premium & has custom_prefix, return it.
-    Otherwise return a benign default 've' (but text cmds will be blocked for non-premium by checks).
-    """
-    if not message.guild:
-        # Allow DM prefix usage with 've' as fallback
-        return "ve"
-    servers = load_json("servers")
-    entry = servers.get(str(message.guild.id), {})
-    if entry.get("premium_until"):
-        try:
-            # check expiration
-            until = datetime.datetime.fromisoformat(entry.get("premium_until"))
-            if until > datetime.datetime.utcnow():
-                return entry.get("custom_prefix", "ve")
-        except Exception:
-            pass
-    return "ve"  # fallback but commands will be blocked by check
-
-bot = commands.Bot(command_prefix=get_prefix, intents=intents, case_insensitive=True)
-# remove default help to use our custom help (slash + text)
-bot.remove_command("help")
+bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)  # text commands mostly handled manually
+tree = bot.tree
 
 # -----------------------------
 # Files and storage helpers
@@ -80,12 +41,10 @@ FILES = {
     "economy": "economy.json"
 }
 
-# ensure files exist and are valid json
 for fname in FILES.values():
     if not os.path.exists(fname):
         with open(fname, "w", encoding="utf-8") as f:
             json.dump({}, f)
-
 
 def load_json(file_key: str) -> dict:
     path = FILES[file_key]
@@ -94,13 +53,13 @@ def load_json(file_key: str) -> dict:
             data = json.load(f)
             if isinstance(data, dict):
                 return data
+            with open(path, "w", encoding="utf-8") as fw:
+                json.dump({}, fw)
+            return {}
     except Exception:
-        pass
-    # reset file
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({}, f)
-    return {}
-
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        return {}
 
 def save_json(file_key: str, data: dict):
     path = FILES[file_key]
@@ -118,8 +77,8 @@ async def get_user(user_id: int) -> dict:
             "wallet": 0,
             "bank": 0,
             "daily_claimed": None,
-            "work_claims": {},
-            "membership": False,  # VRTEX+ flag for the user (if you sell personal membership)
+            "work_claims": {},   # per-guild last work timestamp ISO
+            "membership": False,
             "xp": 0,
             "level": 1,
             "job": None,
@@ -130,23 +89,60 @@ async def get_user(user_id: int) -> dict:
         save_json("users", users)
     return users[sid]
 
-
 async def update_user(user_id: int, data: dict):
     users = load_json("users")
     sid = str(user_id)
-    users[sid] = users.get(sid, {})
+    if sid not in users:
+        users[sid] = {}
     users[sid].update(data)
     save_json("users", users)
-
 
 async def is_plus(user_id: int) -> bool:
     u = await get_user(user_id)
     return u.get("membership", False)
 
 # -----------------------------
+# Server helpers (premium, prefix, disabled commands)
+# -----------------------------
+def get_server_entry(guild_id: int) -> dict:
+    servers = load_json("servers")
+    gk = str(guild_id)
+    if gk not in servers:
+        servers[gk] = {
+            "premium": None,        # { "expires": iso, "owner_id": int }
+            "prefix": None,         # text prefix string when premium active
+            "disabled_commands": [],# list of command names disabled on this server
+            "pending_keys": {}      # key -> purchaser_id mappings for activation
+        }
+        save_json("servers", servers)
+    return servers[gk]
+
+def save_server_entry(guild_id: int, data: dict):
+    servers = load_json("servers")
+    servers[str(guild_id)] = servers.get(str(guild_id), {})
+    servers[str(guild_id)].update(data)
+    save_json("servers", servers)
+
+def server_has_premium(guild_id: int) -> bool:
+    entry = get_server_entry(guild_id)
+    prem = entry.get("premium")
+    if not prem:
+        return False
+    try:
+        exp = datetime.datetime.fromisoformat(prem.get("expires"))
+        return exp > datetime.datetime.utcnow()
+    except Exception:
+        return False
+
+def get_server_prefix(guild_id: int) -> Optional[str]:
+    entry = get_server_entry(guild_id)
+    if server_has_premium(guild_id):
+        return entry.get("prefix")
+    return None
+
+# -----------------------------
 # Economy helpers
 # -----------------------------
-
 def get_guild_economy(guild_id: int) -> dict:
     econ = load_json("economy")
     gid = str(guild_id)
@@ -160,7 +156,6 @@ def get_guild_economy(guild_id: int) -> dict:
         save_json("economy", econ)
     return econ[gid]
 
-
 def set_guild_economy(guild_id: int, data: dict):
     econ = load_json("economy")
     econ[str(guild_id)] = econ.get(str(guild_id), {})
@@ -170,10 +165,8 @@ def set_guild_economy(guild_id: int, data: dict):
 # -----------------------------
 # Utility
 # -----------------------------
-
 def utc_now():
     return datetime.datetime.utcnow()
-
 
 def readable_time_delta(sec: int) -> str:
     m, s = divmod(int(sec), 60)
@@ -187,7 +180,6 @@ def readable_time_delta(sec: int) -> str:
 # -----------------------------
 # Leveling helper
 # -----------------------------
-
 async def add_xp(user_id: int, amount: int):
     user = await get_user(user_id)
     user['xp'] = user.get('xp', 0) + amount
@@ -200,160 +192,383 @@ async def add_xp(user_id: int, amount: int):
     return leveled
 
 # -----------------------------
-# Premium flow helpers
+# Premium helpers (key generation / purchase simulation)
 # -----------------------------
+def generate_premium_key() -> str:
+    return "".join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(10))
 
-def generate_otp(length=8) -> str:
-    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return ''.join(random.choice(chars) for _ in range(length))
-
-
-def add_pending_key(user_id: int, months: int) -> str:
-    servers = load_json("servers")
-    pending = servers.get("_pending_keys", {})
-    otp = generate_otp()
-    # ensure uniqueness
-    while otp in pending:
-        otp = generate_otp()
-    pending[otp] = {
-        "user_id": user_id,
-        "months": months,
-        "created_at": utc_now().isoformat(),
-        "used": False
-    }
-    servers["_pending_keys"] = pending
-    save_json("servers", servers)
-    return otp
-
-
-def use_pending_key(otp: str) -> Optional[dict]:
-    servers = load_json("servers")
-    pending = servers.get("_pending_keys", {})
-    entry = pending.get(otp)
-    if not entry:
-        return None
-    if entry.get("used"):
-        return None
-    # mark used
-    entry["used"] = True
-    pending[otp] = entry
-    servers["_pending_keys"] = pending
-    save_json("servers", servers)
-    return entry
-
-# -----------------------------
-# Premium activation / grant (owner-side helper)
-# -----------------------------
-
-@bot.tree.command(name="premium_grant", description="OWNER: mark payment done and generate OTP for user (owner-only).")
-@app_commands.describe(user_id="Discord user id who paid", months="Number of months to grant the OTP for")
-async def premium_grant(interaction: discord.Interaction, user_id: str, months: int = 1):
-    # This command is intended for bot owner or your backend to call when a payment clears.
-    if interaction.user.id != OWNER_ID and interaction.user.id not in TEAM_IDS:
-        await interaction.response.send_message("Only the bot owner or team can run this.", ephemeral=True)
-        return
+async def deliver_premium_key_dm(user: discord.User, key: str, months: int = 1):
     try:
-        uid = int(user_id)
+        await user.send(f"✅ Your VRTEX+ activation key (valid for {months} month(s)): **{key}**\nUse it in the server with `/premium activate {key}` to activate premium there.")
     except Exception:
-        await interaction.response.send_message("Invalid user id.", ephemeral=True)
-        return
-    otp = add_pending_key(uid, months)
-    # DM the purchaser with the key
-    try:
-        user = await bot.fetch_user(uid)
-        await user.send(f"Thanks for your payment! Your VRTEX Economy premium activation key is:\n`{otp}`\nUse `/premium activate <key>` in the server where you'd like to enable VRTEX+.")
-        await interaction.response.send_message(f"OTP generated and DM'd to <@{uid}>.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"Failed to DM user (they may have DMs off). OTP: `{otp}`\nError: {e}", ephemeral=True)
-
-# Activation command: user uses OTP in a server to activate premium for that guild
-@bot.tree.command(name="premium_activate", description="Activate VRTEX+ for this server with a one-time key.")
-@app_commands.describe(key="One-time activation key you received by DM")
-async def premium_activate(interaction: discord.Interaction, key: str):
-    # must be used in guild and by a manager (server admin)
-    if not interaction.guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
-        return
-    if not interaction.user.guild_permissions.manage_guild and interaction.user.id != OWNER_ID and interaction.user.id not in TEAM_IDS:
-        await interaction.response.send_message("You need Manage Server permission to activate premium.", ephemeral=True)
-        return
-    pending = load_json("servers").get("_pending_keys", {})
-    entry = pending.get(key)
-    if not entry:
-        await interaction.response.send_message("Invalid or expired key.", ephemeral=True)
-        return
-    if entry.get("used"):
-        await interaction.response.send_message("This key has already been used.", ephemeral=True)
-        return
-    # Use and apply
-    # mark used
-    use_pending_key(key)
-    months = int(entry.get("months", 1))
-    now = utc_now()
-    delta = datetime.timedelta(days=30 * months)
-    servers = load_json("servers")
-    guild_entry = servers.get(str(interaction.guild.id), {})
-    existing_until = None
-    if guild_entry.get("premium_until"):
-        try:
-            existing_until = datetime.datetime.fromisoformat(guild_entry.get("premium_until"))
-        except Exception:
-            existing_until = None
-    if existing_until and existing_until > now:
-        new_until = existing_until + delta
-    else:
-        new_until = now + delta
-    guild_entry["premium_until"] = new_until.isoformat()
-    # default custom prefix keeps previous or stays as 've' until set
-    guild_entry.setdefault("custom_prefix", guild_entry.get("custom_prefix", "ve"))
-    guild_entry.setdefault("disabled_commands", guild_entry.get("disabled_commands", []))
-    servers[str(interaction.guild.id)] = guild_entry
-    save_json("servers", servers)
-    await interaction.response.send_message(f"✅ VRTEX+ activated for this server until **{new_until.date()}** ({(new_until - now).days} days).", ephemeral=True)
-    # notify server owner in system channel if possible
-    try:
-        ch = interaction.guild.system_channel or interaction.channel
-        await ch.send(f"🎉 Server premium activated by {interaction.user.mention}. VRTEX+ active until **{new_until.date()}**.")
-    except Exception:
+        # ignore if can't DM
         pass
 
 # -----------------------------
-# Slash commands (primary interface) — examples: /help, /balance, /work, /settings
+# Premium purchase (placeholder) & activation commands
 # -----------------------------
+@tree.command(name="premium", description="Premium purchase / activation commands")
+@app_commands.describe(action="purchase | activate | info")
+async def premium(interaction: discord.Interaction, action: str, key: Optional[str] = None):
+    # This grouped command serves a few sub-actions: purchase, activate, info
+    # but app_commands doesn't support dynamic subcommands easily in single function
+    # We'll route by action string.
+    action = (action or "").lower()
+    if action == "purchase":
+        # Only allow administrators or owner to initiate purchase flow
+        if not interaction.user.guild_permissions.manage_guild and interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("You need Manage Server permission (or owner) to purchase premium for a server.", ephemeral=True)
+            return
+        # simulate payment: generate key and DM purchaser
+        months = 1  # default; you can extend to choose monthly/yearly
+        key = generate_premium_key()
+        servers = load_json("servers")
+        servers[str(interaction.guild.id)] = servers.get(str(interaction.guild.id), {})
+        servers[str(interaction.guild.id)].setdefault("pending_keys", {})[key] = {
+            "purchaser": interaction.user.id,
+            "months": months,
+            "created": utc_now().isoformat()
+        }
+        save_json("servers", servers)
+        # DM the buyer
+        await deliver_premium_key_dm(interaction.user, key, months=months)
+        await interaction.response.send_message("✅ Payment processed (simulated). A one-time key has been sent to your DMs. Use `/premium activate <key>` in this server to activate.", ephemeral=True)
+        return
 
-@bot.tree.command(name="help", description="Show VRTEX Economy help & commands")
-async def slash_help(interaction: discord.Interaction):
-    # custom help embed for slash users
+    if action == "activate":
+        # activation in server using key
+        if not interaction.guild:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+        if not key:
+            await interaction.response.send_message("You must pass your activation key. Example: `/premium activate ABC123...`", ephemeral=True)
+            return
+        servers = load_json("servers")
+        entry = servers.get(str(interaction.guild.id), {})
+        pending = entry.get("pending_keys", {})
+        kinfo = pending.get(key)
+        if not kinfo:
+            await interaction.response.send_message("❌ Invalid or already-used key.", ephemeral=True)
+            return
+        # mark premium: set expiry based on months purchased (simple monthly)
+        months = kinfo.get("months", 1)
+        expires = (utc_now() + datetime.timedelta(days=30*months)).isoformat()
+        entry["premium"] = {"expires": expires, "owner_id": kinfo.get("purchaser")}
+        # default prefix after activation
+        entry["prefix"] = "ve"
+        # remove the key from pending
+        pending.pop(key, None)
+        entry["pending_keys"] = pending
+        servers[str(interaction.guild.id)] = entry
+        save_json("servers", servers)
+        await interaction.response.send_message(f"🎉 Server premium activated! Expires: {expires}. Default text prefix set to `ve`. Use `/settings` to customize.", ephemeral=True)
+        return
+
+    if action == "info":
+        if not interaction.guild:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+        entry = get_server_entry(interaction.guild.id)
+        prem = entry.get("premium")
+        if not prem:
+            await interaction.response.send_message("This server doesn't have VRTEX+ activated.", ephemeral=True)
+            return
+        try:
+            exp = datetime.datetime.fromisoformat(prem.get("expires"))
+            delta = (exp - utc_now()).total_seconds()
+            await interaction.response.send_message(f"Premium expires on {exp.date()} ({readable_time_delta(delta)} remaining).", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Unable to read premium expiry.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("Invalid premium action. Use `purchase`, `activate` or `info`.", ephemeral=True)
+
+# -----------------------------
+# Premium grant (owner-only) - immediately grant premium for testing / owner use
+# -----------------------------
+@tree.command(name="premium_grant", description="(Owner) grant premium to a server for testing / manual grant")
+@app_commands.describe(guild_id="ID of guild to grant", months="months to grant")
+async def premium_grant(interaction: discord.Interaction, guild_id: int, months: int = 1):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Only the bot owner can use this.", ephemeral=True)
+        return
+    servers = load_json("servers")
+    entry = servers.get(str(guild_id), {})
+    expires = (utc_now() + datetime.timedelta(days=30*months)).isoformat()
+    entry["premium"] = {"expires": expires, "owner_id": interaction.user.id}
+    entry["prefix"] = "ve"
+    servers[str(guild_id)] = entry
+    save_json("servers", servers)
+    await interaction.response.send_message(f"Granted premium to server {guild_id} until {expires}.", ephemeral=True)
+
+# -----------------------------
+# Settings UI (slash) - when premium is active allow prefix change
+# -----------------------------
+class PrefixModal(Modal, title="Set Server Prefix"):
+    prefix = TextInput(label="Prefix (e.g. ve, !, @, 21)", placeholder="ve", required=True, max_length=10)
+    def __init__(self, guild: discord.Guild, user: discord.Member):
+        super().__init__()
+        self.guild = guild
+        self.user = user
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # only allow if premium active and user has manage_guild
+        if not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+            await interaction.response.send_message("You need Manage Server permission (or owner/team) to change prefix.", ephemeral=True)
+            return
+        if not server_has_premium(self.guild.id):
+            await interaction.response.send_message("This server is not VRTEX+. Custom prefix only for VRTEX+ servers.", ephemeral=True)
+            return
+        p = self.prefix.value.strip()
+        # basic validation
+        if len(p) == 0:
+            await interaction.response.send_message("Invalid prefix.", ephemeral=True)
+            return
+        entry = get_server_entry(self.guild.id)
+        entry['prefix'] = p
+        save_server_entry(self.guild.id, entry)
+        await interaction.response.send_message(f"✅ Prefix set to `{p}` for this server. Text-prefix commands are now active alongside slash commands.", ephemeral=True)
+
+class SettingsView(View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+    @discord.ui.button(label="Economy", style=discord.ButtonStyle.primary)
+    async def econ_btn(self, interaction: discord.Interaction, button: Button):
+        econ = get_guild_economy(self.guild.id)
+        embed = discord.Embed(title="Economy Settings", description=f"Currency: **{econ.get('currency_name')}** `{econ.get('currency_symbol','')}`\nStarting balance: **{econ.get('starting_balance',0)}**\nTax: **{econ.get('tax_rate',0)}%**", color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Commands toggle", style=discord.ButtonStyle.secondary)
+    async def toggle_btn(self, interaction: discord.Interaction, button: Button):
+        servers = load_json("servers")
+        entry = servers.get(str(self.guild.id), {})
+        disabled = entry.get("disabled_commands", [])
+        # present a simple message listing disabled commands and how to toggle them via command (for brevity)
+        await interaction.response.send_message(f"Disabled commands on this server: {disabled or 'None'}. Use `/settings toggle <command>` to toggle.", ephemeral=True)
+
+    @discord.ui.button(label="Prefix / Premium Info", style=discord.ButtonStyle.gray)
+    async def prefix_btn(self, interaction: discord.Interaction, button: Button):
+        # show premium status & allow prefix modal if premium
+        entry = get_server_entry(self.guild.id)
+        prem = entry.get("premium")
+        if not server_has_premium(self.guild.id):
+            await interaction.response.send_message("This server is not premium. Admins can purchase premium using `/premium purchase`.", ephemeral=True)
+            return
+        # show remaining time button and prefix set option
+        p = entry.get("prefix") or "(default ve)"
+        embed = discord.Embed(title="VRTEX+ Info", description=f"Prefix: `{p}`", color=discord.Color.blurple())
+        # add a dynamic button below to show expiry
+        view = View()
+        async def time_cb(inter: discord.Interaction):
+            try:
+                exp = datetime.datetime.fromisoformat(prem.get("expires"))
+                delta = (exp - utc_now()).total_seconds()
+                await inter.response.send_message(f"Premium expires on **{exp.date()}** ({readable_time_delta(delta)} remaining).", ephemeral=True)
+            except Exception:
+                await inter.response.send_message("Could not read expiry.", ephemeral=True)
+        btn_time = Button(label="Show time left", style=discord.ButtonStyle.primary)
+        btn_time.callback = time_cb
+        view.add_item(btn_time)
+        async def setpref_cb(inter: discord.Interaction):
+            await inter.response.send_modal(PrefixModal(self.guild, inter.user))
+        btn_set = Button(label="Change Prefix", style=discord.ButtonStyle.secondary)
+        btn_set.callback = setpref_cb
+        view.add_item(btn_set)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@tree.command(name="settings", description="Open VRTEX settings (Manage Server required to change)")
+async def settings(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    if not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+        await interaction.response.send_message("You need Manage Server permission (or owner/team) to access settings.", ephemeral=True)
+        return
+    embed = discord.Embed(title="⚙️ VRTEX Settings", description="Use the buttons to configure economy & premium options.", color=discord.Color.orange())
+    guild_entry = get_server_entry(interaction.guild.id)
+    econ = get_guild_economy(interaction.guild.id)
+    prem = guild_entry.get("premium")
+    prefix = guild_entry.get("prefix") or "Not set"
+    embed.add_field(name="Current", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**\nTax: **{econ.get('tax_rate',0)}%**\nPremium: **{'Active' if server_has_premium(interaction.guild.id) else 'Not active'}**\nPrefix: **{prefix}**", inline=False)
+    view = SettingsView(interaction.guild)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+# toggle subcommand for settings to disable/enable commands
+@tree.command(name="settings_toggle", description="Toggle a command on this server")
+@app_commands.describe(command_name="command name to toggle")
+async def settings_toggle(interaction: discord.Interaction, command_name: str):
+    if not interaction.guild:
+        await interaction.response.send_message("Use in a server.", ephemeral=True); return
+    if not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
+        await interaction.response.send_message("You need Manage Server permission.", ephemeral=True); return
+    servers = load_json("servers")
+    entry = servers.get(str(interaction.guild.id), {})
+    disabled = entry.get("disabled_commands", [])
+    if command_name in disabled:
+        disabled.remove(command_name)
+        msg = f"Enabled {command_name}"
+    else:
+        disabled.append(command_name)
+        msg = f"Disabled {command_name}"
+    entry["disabled_commands"] = disabled
+    servers[str(interaction.guild.id)] = entry
+    save_json("servers", servers)
+    await interaction.response.send_message(f"✅ {msg}", ephemeral=True)
+
+# -----------------------------
+# Help command (slash) - custom embed listing commands & categories
+# -----------------------------
+@tree.command(name="help", description="Show VRTEX Economy help & commands")
+async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="💠 VRTEX Economy — Help", description="Slash commands are available below. If you have VRTEX+ you may also use a custom text prefix.", color=discord.Color.from_rgb(88,101,242))
-    embed.add_field(name="Quick", value="`/balance` `/work` `/profile` `/settings` `/premium activate`", inline=False)
-    embed.set_footer(text="Tip: server admins can activate premium to unlock custom prefix and settings.")
+    embed.add_field(name="Quick", value="/balance  /work  /profile  /settings  /premium activate", inline=False)
+    embed.add_field(name="Economy (examples)", value="`/balance` — check balances\n`/deposit <amt>` — deposit to bank\n`/withdraw <amt>` — withdraw\n`/transfer <user> <amt>` — send money", inline=False)
+    embed.add_field(name="Games & Jobs", value="`/work` `/applyjob` `/jobs` `/promote`", inline=False)
+    embed.add_field(name="Business & Market", value="`/business buy` `/business list` `/market list`", inline=False)
+    embed.add_field(name="Adventure & Quests", value="`/adventure` `/quests` `/achievements`", inline=False)
+    embed.add_field(name="Premium perks", value="+25% work income, x2 daily, -20% cooldown, custom prefix, exclusive items", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
+# -----------------------------
+# Core economy slash commands (and underlying helpers used by both slash & text)
+# -----------------------------
+def make_embed(title: str, description: str = None, color=None):
+    c = color or discord.Color.from_rgb(34, 37, 46)
+    e = discord.Embed(title=title, description=description or "", color=c)
+    return e
 
-@bot.tree.command(name="balance", description="Show your balance")
-@app_commands.describe(member="Member to view (optional)")
+async def send_balance_embed_ctx(ctx_or_inter, member: discord.Member):
+    if isinstance(ctx_or_inter, discord.Interaction):
+        guild = ctx_or_inter.guild
+        author = member
+        # use response
+        econ = get_guild_economy(guild.id) if guild else {"currency_symbol":"$"}
+        name = econ.get("currency_name","Coins")
+        sym = econ.get("currency_symbol","")
+        user = await get_user(member.id)
+        wallet = user.get("wallet",0); bank = user.get("bank",0)
+        embed = make_embed(f"{member.display_name}'s Balance", None, None)
+        embed.add_field(name=f"{name} (Wallet)", value=f"{wallet} {sym}", inline=True)
+        embed.add_field(name=f"{name} (Bank)", value=f"{bank} {sym}", inline=True)
+        embed.add_field(name="Membership", value="VRTEX+" if user.get("membership") else "Normal", inline=False)
+        await ctx_or_inter.response.send_message(embed=embed)
+    else:
+        # ctx_or_inter is message
+        msg = ctx_or_inter
+        guild = msg.guild
+        member = member or msg.author
+        econ = get_guild_economy(guild.id) if guild else {"currency_symbol":"$"}
+        name = econ.get("currency_name","Coins")
+        sym = econ.get("currency_symbol","")
+        user = await get_user(member.id)
+        wallet = user.get("wallet",0); bank = user.get("bank",0)
+        embed = make_embed(f"{member.display_name}'s Balance", None, None)
+        embed.add_field(name=f"{name} (Wallet)", value=f"{wallet} {sym}", inline=True)
+        embed.add_field(name=f"{name} (Bank)", value=f"{bank} {sym}", inline=True)
+        embed.add_field(name="Membership", value="VRTEX+" if user.get("membership") else "Normal", inline=False)
+        await msg.channel.send(embed=embed)
+
+@tree.command(name="balance", description="Check your wallet & bank")
+@app_commands.describe(member="Member to check")
 async def slash_balance(interaction: discord.Interaction, member: Optional[discord.Member] = None):
-    target = member or interaction.user
-    user = await get_user(target.id)
-    guild_econ = get_guild_economy(interaction.guild.id) if interaction.guild else {"currency_symbol":"$"}
-    sym = guild_econ.get("currency_symbol", "")
-    embed = discord.Embed(title=f"{target.display_name}'s Balance", color=discord.Color.dark_gray())
-    embed.add_field(name="Wallet", value=f"{user.get('wallet',0)} {sym}", inline=True)
-    embed.add_field(name="Bank", value=f"{user.get('bank',0)} {sym}", inline=True)
-    embed.add_field(name="Membership", value="VRTEX+" if user.get('membership') else "Normal", inline=False)
+    member = member or interaction.user
+    await send_balance_embed_ctx(interaction, member)
+
+# deposit
+@tree.command(name="deposit", description="Deposit money into your bank")
+@app_commands.describe(amount="Amount to deposit")
+async def slash_deposit(interaction: discord.Interaction, amount: int):
+    user = await get_user(interaction.user.id)
+    if amount <= 0 or amount > user.get("wallet",0):
+        await interaction.response.send_message("❌ Invalid deposit amount or insufficient wallet funds.", ephemeral=True)
+        return
+    user['wallet'] -= amount
+    user['bank'] = user.get('bank',0) + amount
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message(f"✅ Deposited {amount}{get_guild_economy(interaction.guild.id).get('currency_symbol','')} into your bank.")
+
+# withdraw
+@tree.command(name="withdraw", description="Withdraw money from your bank")
+@app_commands.describe(amount="Amount to withdraw")
+async def slash_withdraw(interaction: discord.Interaction, amount: int):
+    user = await get_user(interaction.user.id)
+    if amount <= 0 or amount > user.get("bank",0):
+        await interaction.response.send_message("❌ Invalid withdraw amount or insufficient bank funds.", ephemeral=True)
+        return
+    user['bank'] -= amount
+    user['wallet'] = user.get('wallet',0) + amount
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message(f"✅ Withdrawn {amount}{get_guild_economy(interaction.guild.id).get('currency_symbol','')} to your wallet.")
+
+# transfer
+@tree.command(name="transfer", description="Send money to another user")
+@app_commands.describe(member="Recipient", amount="Amount to send")
+async def slash_transfer(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("❌ You cannot transfer to yourself.", ephemeral=True); return
+    sender = await get_user(interaction.user.id)
+    receiver = await get_user(member.id)
+    if amount <= 0 or amount > sender.get('wallet',0):
+        await interaction.response.send_message("❌ Invalid transfer amount or insufficient balance.", ephemeral=True); return
+    sender['wallet'] -= amount
+    receiver['wallet'] = receiver.get('wallet',0) + amount
+    await update_user(interaction.user.id, sender)
+    await update_user(member.id, receiver)
+    await interaction.response.send_message(f"✅ Transferred {amount}{get_guild_economy(interaction.guild.id).get('currency_symbol','')} to {member.mention}!")
+
+# leaderboard
+@tree.command(name="leaderboard", description="View the richest users")
+async def slash_leaderboard(interaction: discord.Interaction):
+    users = load_json("users")
+    ranking = []
+    for uid, data in users.items():
+        total = data.get('wallet', 0) + data.get('bank', 0)
+        ranking.append((uid, total))
+    ranking.sort(key=lambda x: x[1], reverse=True)
+    embed = make_embed("💰 Top Richest Users", None, None)
+    guild = interaction.guild
+    count = 0
+    for uid, total in ranking:
+        if count >= 10:
+            break
+        try:
+            member = guild.get_member(int(uid)) if guild else None
+            name = member.display_name if member else f"User {uid}"
+        except Exception:
+            name = f"User {uid}"
+        embed.add_field(name=name, value=f"Total: {total}{get_guild_economy(guild.id).get('currency_symbol','')}", inline=False)
+        count += 1
     await interaction.response.send_message(embed=embed)
 
+# profile
+@tree.command(name="profile", description="View your or another user's profile")
+@app_commands.describe(member="Member to view")
+async def slash_profile(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    member = member or interaction.user
+    user = await get_user(member.id)
+    econ = get_guild_economy(interaction.guild.id) if interaction.guild else {"currency_symbol":"$"}
+    embed = make_embed(f"{member.display_name}'s Profile", None, None)
+    embed.add_field(name="Balance", value=f"{user.get('wallet',0)+user.get('bank',0)}{econ.get('currency_symbol','')}", inline=False)
+    embed.add_field(name="Level & XP", value=f"Level {user.get('level',1)} (XP: {user.get('xp',0)})", inline=False)
+    embed.add_field(name="Job", value=user.get('job') or "Unemployed", inline=False)
+    embed.add_field(name="Businesses", value=", ".join(user.get('businesses',{}).keys()) or "None", inline=False)
+    await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="work", description="Work and earn (once per hour)")
+# -----------------------------
+# Work & Jobs
+# -----------------------------
+@tree.command(name="work", description="Work to earn coins (1-hour cooldown)")
 async def slash_work(interaction: discord.Interaction):
     user = await get_user(interaction.user.id)
-    guild_id = str(interaction.guild.id) if interaction.guild else None
-    if not guild_id:
-        await interaction.response.send_message("Work can only be used inside a server.", ephemeral=True)
-        return
+    if not interaction.guild:
+        await interaction.response.send_message("Work can only be used in servers.", ephemeral=True); return
+    guild_id = str(interaction.guild.id)
     last_claims = user.get("work_claims", {})
     now = utc_now()
     last_iso = last_claims.get(guild_id)
+    # cooldown base 3600 sec
     cooldown = 3600
     if last_iso:
         try:
@@ -365,9 +580,11 @@ async def slash_work(interaction: discord.Interaction):
         except Exception:
             pass
     reward = 1000
+    # premium perks: if user is VRTEX+, apply +25%
     if await is_plus(interaction.user.id):
         reward = int(reward * 1.25)
-    user['wallet'] = user.get('wallet',0) + reward
+    # server premium perk: -20% cooldown: if server premium, reduce cooldown (not reward here)
+    user['wallet'] = user.get('wallet', 0) + reward
     last_claims[guild_id] = now.isoformat()
     user['work_claims'] = last_claims
     await update_user(interaction.user.id, user)
@@ -377,148 +594,405 @@ async def slash_work(interaction: discord.Interaction):
         msg += "\n🎉 You leveled up!"
     await interaction.response.send_message(msg)
 
+# Job-related commands (simplified)
+JOBS = {
+    "cashier": {"pay": 500, "chance_promote": 0.2},
+    "developer": {"pay": 1200, "chance_promote": 0.12},
+    "miner": {"pay": 900, "chance_promote": 0.15},
+}
+
+@tree.command(name="jobs", description="List available jobs")
+async def slash_jobs(interaction: discord.Interaction):
+    embed = make_embed("💼 Jobs", None, None)
+    for name, info in JOBS.items():
+        embed.add_field(name=name.title(), value=f"Pay: {info['pay']} | Promote chance: {int(info['chance_promote']*100)}%", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="applyjob", description="Apply for a job")
+@app_commands.describe(job_name="Job name")
+async def slash_applyjob(interaction: discord.Interaction, job_name: str):
+    job_name = job_name.lower().strip()
+    if job_name not in JOBS:
+        await interaction.response.send_message("❌ Job not found.", ephemeral=True); return
+    user = await get_user(interaction.user.id)
+    user['job'] = job_name
+    user['job_streak'] = 0
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message(f"✅ You are now employed as **{job_name.title()}**.")
+
+@tree.command(name="quitjob", description="Leave your current job")
+async def slash_quitjob(interaction: discord.Interaction):
+    user = await get_user(interaction.user.id)
+    if not user.get("job"):
+        await interaction.response.send_message("You don't have a job.", ephemeral=True); return
+    user['job'] = None
+    user['job_streak'] = 0
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message("You left your job.")
+
+@tree.command(name="promote", description="Attempt an automatic promotion")
+async def slash_promote(interaction: discord.Interaction):
+    user = await get_user(interaction.user.id)
+    job = user.get("job")
+    if not job:
+        await interaction.response.send_message("You have no job.", ephemeral=True); return
+    info = JOBS.get(job, {})
+    chance = info.get("chance_promote", 0.1)
+    if random.random() < chance:
+        # promotion effect: increase pay (we'll simulate by increasing stored 'job_rank' or similar)
+        user.setdefault("job_rank", 1)
+        user["job_rank"] += 1
+        await update_user(interaction.user.id, user)
+        await interaction.response.send_message(f"🎉 Congratulations — you were promoted! New rank: {user['job_rank']}")
+    else:
+        await interaction.response.send_message("No promotion this time. Keep working!")
+
 # -----------------------------
-# Settings slash command: shows view with Subscription button
+# Business system (simplified)
 # -----------------------------
+DEFAULT_BUSINESSES = {
+    "Bakery": {"cost": 5000, "profit": 500, "upkeep": 50, "tier": 1},
+    "Mine": {"cost": 10000, "profit": 1200, "upkeep": 150, "tier": 2},
+    "Shop": {"cost": 20000, "profit": 2500, "upkeep": 300, "tier": 3},
+    # tier 3-5 may be unlocked by premium when implementing expansion
+}
 
-class SettingsView(View):
-    def __init__(self, guild: discord.Guild):
-        super().__init__(timeout=300)
-        self.guild = guild
+@tree.group(name="business", description="Business commands")
+async def business_group(interaction: discord.Interaction):
+    # grouped command placeholder
+    await interaction.response.send_message("Use subcommands: buy / list / claim / upgrade / info", ephemeral=True)
 
-    @discord.ui.button(label="Subscription", style=discord.ButtonStyle.secondary, custom_id="sv_subscription")
-    async def subscription_btn(self, interaction: discord.Interaction, button: Button):
-        # show subscription info
-        servers = load_json("servers")
-        g = servers.get(str(self.guild.id), {})
-        until_iso = g.get("premium_until")
-        if not until_iso:
-            await interaction.response.send_message("This server does not have VRTEX+ active.", ephemeral=True)
-            return
-        try:
-            until = datetime.datetime.fromisoformat(until_iso)
-        except Exception:
-            await interaction.response.send_message("Subscription info corrupted.", ephemeral=True)
-            return
-        now = utc_now()
-        if until < now:
-            await interaction.response.send_message("VRTEX+ subscription has expired.", ephemeral=True)
-            return
-        delta = until - now
-        await interaction.response.send_message(f"📅 VRTEX+ active until **{until.date()}** — **{delta.days} days** remaining.", ephemeral=True)
+@business_group.command(name="list", description="Show available businesses")
+async def business_list(interaction: discord.Interaction):
+    embed = make_embed("🏠 Available Businesses", None, None)
+    for name, info in DEFAULT_BUSINESSES.items():
+        embed.add_field(name=name, value=f"Cost: {info['cost']} | Profit: {info['profit']}", inline=False)
+    await interaction.response.send_message(embed=embed)
 
+@business_group.command(name="buy", description="Buy a business")
+@app_commands.describe(name="Business name")
+async def business_buy(interaction: discord.Interaction, name: str):
+    name = name.title()
+    if name not in DEFAULT_BUSINESSES:
+        await interaction.response.send_message("❌ Business not found.", ephemeral=True); return
+    user = await get_user(interaction.user.id)
+    if name in user.get("businesses", {}):
+        await interaction.response.send_message("❌ You already own this business.", ephemeral=True); return
+    cost = DEFAULT_BUSINESSES[name]['cost']
+    if user.get('wallet', 0) < cost:
+        await interaction.response.send_message("❌ Not enough money.", ephemeral=True); return
+    user['wallet'] -= cost
+    user.setdefault('businesses', {})[name] = DEFAULT_BUSINESSES[name].copy()
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message(f"✅ You bought **{name}**!")
 
-@bot.tree.command(name="settings", description="Server settings (Manage Server only). Shows Subscription status and economy options.)")
-async def slash_settings(interaction: discord.Interaction):
-    # permission check
-    if not interaction.guild:
-        await interaction.response.send_message("Settings must be used in a server.", ephemeral=True)
+@business_group.command(name="claim", description="Claim profits from your businesses")
+async def business_claim(interaction: discord.Interaction):
+    user = await get_user(interaction.user.id)
+    total = 0
+    for b, info in user.get('businesses', {}).items():
+        total += info.get('profit', 0)
+    user['wallet'] = user.get('wallet', 0) + total
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message(f"✅ Claimed {total}{get_guild_economy(interaction.guild.id).get('currency_symbol','')} from your businesses.")
+
+@business_group.command(name="info", description="Get info on a business")
+@app_commands.describe(name="Business name")
+async def business_info(interaction: discord.Interaction, name: str):
+    name = name.title()
+    info = DEFAULT_BUSINESSES.get(name)
+    if not info:
+        await interaction.response.send_message("❌ Business not found.", ephemeral=True); return
+    embed = make_embed(f"{name} Info", None, None)
+    embed.add_field(name="Cost", value=str(info['cost']), inline=True)
+    embed.add_field(name="Profit", value=str(info['profit']), inline=True)
+    embed.add_field(name="Tier", value=str(info['tier']), inline=True)
+    await interaction.response.send_message(embed=embed)
+
+# -----------------------------
+# Marketplace & inventory (simplified)
+# -----------------------------
+@tree.command(name="inventory", description="Check your items")
+async def slash_inventory(interaction: discord.Interaction):
+    user = await get_user(interaction.user.id)
+    items = user.get("items", {})
+    if not items:
+        await interaction.response.send_message("Your inventory is empty.", ephemeral=True); return
+    txt = "\n".join(f"{k}: {v}" for k,v in items.items())
+    await interaction.response.send_message(f"📦 Your items:\n{txt}")
+
+@tree.command(name="use", description="Use an item")
+@app_commands.describe(item="Item name")
+async def slash_use(interaction: discord.Interaction, item: str):
+    user = await get_user(interaction.user.id)
+    items = user.get("items", {})
+    if items.get(item,0) <= 0:
+        await interaction.response.send_message("You don't have that item.", ephemeral=True); return
+    # example item effect: if "xp_potion" then add xp
+    items[item] -= 1
+    user['items'] = items
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message(f"Used one {item}. (No special effect implemented for demo)")
+
+@tree.command(name="sell", description="Sell an item")
+@app_commands.describe(item="Item name", price="Price to sell for")
+async def slash_sell(interaction: discord.Interaction, item: str, price: int):
+    user = await get_user(interaction.user.id)
+    items = user.get("items", {})
+    if items.get(item,0) <= 0:
+        await interaction.response.send_message("You don't have that item.", ephemeral=True); return
+    items[item] -= 1
+    user['wallet'] = user.get('wallet',0) + price
+    user['items'] = items
+    await update_user(interaction.user.id, user)
+    await interaction.response.send_message(f"Sold {item} for {price}.")
+
+# -----------------------------
+# Adventure & quests (simplified)
+# -----------------------------
+@tree.command(name="adventure", description="Explore and find rewards")
+async def slash_adventure(interaction: discord.Interaction):
+    # simple random reward
+    outcomes = [
+        ("Found coins", 500),
+        ("Found nothing", 0),
+        ("Found item", "mysterious_gem"),
+        ("Ambushed and lost coins", -200)
+    ]
+    pick = random.choice(outcomes)
+    user = await get_user(interaction.user.id)
+    if isinstance(pick[1], int):
+        change = pick[1]
+        if change >= 0:
+            user['wallet'] = user.get('wallet',0) + change
+            await update_user(interaction.user.id, user)
+            await interaction.response.send_message(f"🧭 {pick[0]}: {change}{get_guild_economy(interaction.guild.id).get('currency_symbol','')}")
+        else:
+            user['wallet'] = max(0, user.get('wallet',0) + change)
+            await update_user(interaction.user.id, user)
+            await interaction.response.send_message(f"🧭 {pick[0]}: {change}{get_guild_economy(interaction.guild.id).get('currency_symbol','')}")
+    else:
+        item = pick[1]
+        user.setdefault('items', {}).setdefault(item, 0)
+        user['items'][item] += 1
+        await update_user(interaction.user.id, user)
+        await interaction.response.send_message(f"🧭 {pick[0]}: gained **{item}**!")
+
+@tree.command(name="quests", description="Show current quests")
+async def slash_quests(interaction: discord.Interaction):
+    # simplified static quests
+    embed = make_embed("🧭 Quests", "Active quests & rewards")
+    embed.add_field(name="First Steps", value="Do /work 5 times — Reward: 1000", inline=False)
+    embed.add_field(name="Treasure Hunter", value="Do /adventure 3 times — Reward: item", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="achievements", description="Show achievements")
+async def slash_achievements(interaction: discord.Interaction):
+    # placeholder achievements
+    await interaction.response.send_message("🏆 Achievements: Beginner, Worker, Explorer (demo)")
+
+# -----------------------------
+# Local text-prefix command bridge for premium servers
+# We manually parse messages that start with the server's configured prefix
+# and dispatch them to the corresponding functions above.
+# -----------------------------
+TEXT_COMMAND_MAP = {
+    # aliases map to slash command names or internal handlers
+    "balance": "balance",
+    "vebalance": "balance",
+    "bal": "balance",
+    "deposit": "deposit",
+    "withdraw": "withdraw",
+    "transfer": "transfer",
+    "work": "work",
+    "vework": "work",
+    "profile": "profile",
+    "veprofile": "profile",
+    "leaderboard": "leaderboard",
+    "veleaderboard": "leaderboard",
+    "inventory": "inventory",
+    "use": "use",
+    "sell": "sell",
+    "adventure": "adventure",
+    "quests": "quests",
+    "achievements": "achievements",
+    "business": "business",   # needs parsing of subcommands
+    "market": "market",       # not fully implemented
+    "settings": "settings"
+}
+
+# Simplified argument splitter (preserves mention as first arg)
+def split_args(content: str) -> List[str]:
+    parts = content.strip().split()
+    return parts
+
+@bot.event
+async def on_message(message: discord.Message):
+    # ignore bots
+    if message.author.bot:
         return
-    if not (interaction.user.guild_permissions.manage_guild or interaction.user.id in TEAM_IDS or interaction.user.id == OWNER_ID):
-        await interaction.response.send_message("You need Manage Server permission (or be owner/team) to use settings.", ephemeral=True)
+    # handle text prefix commands only in guilds
+    if not message.guild:
         return
-    econ = get_guild_economy(interaction.guild.id)
-    embed = discord.Embed(title="⚙️ VRTEX Settings", color=discord.Color.blurple())
-    embed.add_field(name="Economy", value=f"Currency: **{econ.get('currency_name')} {econ.get('currency_symbol','')}**\nStarting balance: **{econ.get('starting_balance',0)}**", inline=False)
-    view = SettingsView(interaction.guild)
-    # add an extra button for changing custom prefix if server is premium
-    servers = load_json("servers")
-    g = servers.get(str(interaction.guild.id), {})
-    if g.get("premium_until"):
-        # add a small 'Change Prefix' button
-        async def change_prefix_cb(inter: discord.Interaction):
-            # present a modal to change prefix
-            class PrefixModal(Modal, title="Set Custom Prefix"):
-                new_prefix = TextInput(label="New prefix (single token)", placeholder="e.g. ve or !", max_length=10, required=True)
-                def __init__(self, guild):
-                    super().__init__()
-                    self.guild = guild
-                async def on_submit(self, modal_inter: discord.Interaction):
-                    val = self.new_prefix.value.strip()
-                    # basic validation
-                    if len(val) == 0:
-                        await modal_inter.response.send_message("Invalid prefix.", ephemeral=True)
-                        return
-                    servers_local = load_json("servers")
-                    servers_local.setdefault(str(self.guild.id), {})
-                    servers_local[str(self.guild.id)]["custom_prefix"] = val
-                    save_json("servers", servers_local)
-                    await modal_inter.response.send_message(f"✅ Custom prefix set to `{val}`. You can now use `{val}help` (if available) as a text command in this server.", ephemeral=True)
-            await inter.response.send_modal(PrefixModal(inter.guild))
-
-        # attach as a ephemeral followup via a one-off button
-        btn = Button(label="Change Prefix (Premium)", style=discord.ButtonStyle.primary)
-        btn.callback = lambda inter: asyncio.create_task(change_prefix_cb(inter))
-        view.add_item(btn)
-
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
-
-# -----------------------------
-# Text (prefix) commands — gated to premium servers
-# -----------------------------
-
-def premium_required_text_command(ctx: commands.Context) -> bool:
-    if not ctx.guild:
-        return False
-    servers = load_json("servers")
-    entry = servers.get(str(ctx.guild.id), {})
-    until = entry.get("premium_until")
-    if not until:
-        return False
+    prefix = get_server_prefix(message.guild.id)
+    if not prefix:
+        # no prefix enabled for this server (non-premium), do not treat text commands
+        return
+    # prefix may be multi-char; check start
+    if not message.content.startswith(prefix):
+        # also support prefix with mention of bot optionally? not necessary
+        return
+    # parse
+    content = message.content[len(prefix):].strip()
+    if not content:
+        return
+    parts = split_args(content)
+    cmd = parts[0].lower()
+    args = parts[1:]
+    # map cmd
+    mapped = TEXT_COMMAND_MAP.get(cmd)
+    if not mapped:
+        # maybe subcommands like vebusiness buy
+        if cmd in ("vebusiness", "business"):
+            # parse subcommand
+            if len(args) == 0:
+                await message.channel.send("Usage: business list | buy <name> | claim | info <name>")
+                return
+            sub = args[0].lower()
+            if sub in ("list",):
+                # call slash-like handler
+                # call business_list
+                await business_list._callback(await make_dummy_interaction_from_message(message))
+                return
+            if sub == "buy" and len(args) >= 2:
+                name = " ".join(args[1:])
+                # make a dummy interaction to call same handler
+                inter = await make_dummy_interaction_from_message(message)
+                await business_buy._callback(inter, name)
+                return
+        return
+    # Now dispatch mapped command by calling corresponding handler via app_commands or direct functions
     try:
-        dt = datetime.datetime.fromisoformat(until)
-        if dt > utc_now():
-            return True
-    except Exception:
-        return False
-    return False
+        inter = await make_dummy_interaction_from_message(message)
+        # mapping to call
+        if mapped == "balance":
+            await slash_balance._callback(inter, member=message.author)
+        elif mapped == "deposit":
+            if not args:
+                await message.channel.send("Provide amount.")
+            else:
+                try:
+                    amt = int(args[0])
+                    await slash_deposit._callback(inter, amount=amt)
+                except Exception:
+                    await message.channel.send("Invalid amount.")
+        elif mapped == "withdraw":
+            if not args:
+                await message.channel.send("Provide amount.")
+            else:
+                try:
+                    amt = int(args[0])
+                    await slash_withdraw._callback(inter, amount=amt)
+                except Exception:
+                    await message.channel.send("Invalid amount.")
+        elif mapped == "transfer":
+            if len(args) < 2:
+                await message.channel.send("Usage: <prefix>transfer @user amount")
+            else:
+                # try to resolve user mention or id
+                target = None
+                try:
+                    if message.mentions:
+                        target = message.mentions[0]
+                        amt = int(args[-1])
+                    else:
+                        target = message.guild.get_member(int(args[0]))
+                        amt = int(args[1])
+                    await slash_transfer._callback(inter, member=target, amount=amt)
+                except Exception:
+                    await message.channel.send("Could not parse target or amount.")
+        elif mapped == "work":
+            await slash_work._callback(inter)
+        elif mapped == "profile":
+            # optional mention
+            target = message.author
+            if message.mentions:
+                target = message.mentions[0]
+            await slash_profile._callback(inter, member=target)
+        elif mapped == "leaderboard":
+            await slash_leaderboard._callback(inter)
+        elif mapped == "inventory":
+            await slash_inventory._callback(inter)
+        elif mapped == "use":
+            if not args:
+                await message.channel.send("Provide item name.")
+            else:
+                item = " ".join(args)
+                await slash_use._callback(inter, item=item)
+        elif mapped == "sell":
+            if len(args) < 2:
+                await message.channel.send("Usage: <prefix>sell item price")
+            else:
+                item = " ".join(args[:-1])
+                try:
+                    price = int(args[-1])
+                    await slash_sell._callback(inter, item=item, price=price)
+                except Exception:
+                    await message.channel.send("Invalid price.")
+        elif mapped == "adventure":
+            await slash_adventure._callback(inter)
+        elif mapped == "quests":
+            await slash_quests._callback(inter)
+        elif mapped == "achievements":
+            await slash_achievements._callback(inter)
+        elif mapped == "settings":
+            await settings._callback(inter)
+        else:
+            await message.channel.send("Command mapping not implemented yet.")
+    except Exception as e:
+        # debugging
+        await message.channel.send(f"Error dispatching command: {e}")
 
-
-def ensure_premium_text():
-    async def predicate(ctx: commands.Context):
-        if premium_required_text_command(ctx):
-            return True
-        await ctx.send("This server does not have VRTEX+ active. Use slash commands (default) or activate premium.")
-        return False
-    return commands.check(predicate)
-
-
-@bot.command(name="help_text")
-@ensure_premium_text()
-async def help_text(ctx: commands.Context):
-    # show same help but text-based. Only available in premium servers
-    embed = discord.Embed(title="💠 VRTEX Economy — Help (text)")
-    embed.add_field(name="Quick", value="`help` `balance` `work` `settings` `premium activate`", inline=False)
-    await ctx.send(embed=embed)
-
-# duplicate basic commands as text wrappers — they all check premium via decorator
-@bot.command(name="balance_text")
-@ensure_premium_text()
-async def balance_text(ctx: commands.Context, member: discord.Member = None):
-    member = member or ctx.author
-    await send_balance_text(ctx, member)
-
-async def send_balance_text(ctx, member: discord.Member):
-    user = await get_user(member.id)
-    guild_econ = get_guild_economy(ctx.guild.id) if ctx.guild else {"currency_symbol":"$"}
-    sym = guild_econ.get("currency_symbol", "")
-    embed = discord.Embed(title=f"{member.display_name}'s Balance", color=discord.Color.dark_gray())
-    embed.add_field(name="Wallet", value=f"{user.get('wallet',0)} {sym}", inline=True)
-    embed.add_field(name="Bank", value=f"{user.get('bank',0)} {sym}", inline=True)
-    await ctx.send(embed=embed)
-
-# You can add other text-wrapped commands similarly. For brevity we keep a few examples.
+# helper: build a fake Interaction-like object for calling slash callbacks from text
+async def make_dummy_interaction_from_message(message: discord.Message):
+    """
+    Create a very small object that mimics enough of discord.Interaction for our callbacks.
+    We supply `guild`, `user`, `channel`, and wrappers to send a response via message.channel.send.
+    """
+    class DummyResp:
+        def __init__(self, msg: discord.Message):
+            self.msg = msg
+            self.sent = False
+        async def send(self, *args, **kwargs):
+            # emulate Interaction.response.send_message by replying in channel
+            # ephemeral ignored
+            content = kwargs.get("content")
+            embed = kwargs.get("embed")
+            view = kwargs.get("view")
+            if embed is not None:
+                await self.msg.channel.send(embed=embed)
+            elif content is not None:
+                await self.msg.channel.send(content)
+            self.sent = True
+    class DummyInteraction:
+        def __init__(self, message):
+            self.guild = message.guild
+            self.user = message.author
+            self.channel = message.channel
+            self.message = message
+            self.response = DummyResp(message)
+    return DummyInteraction(message)
 
 # -----------------------------
-# Small safety check for disabling commands per-server
+# Robust command-block safety: check disabled commands
 # -----------------------------
 @bot.check
 async def global_command_block(ctx):
-    # Allow DMs / missing guild gracefully
+    # allow dms
     if ctx.guild is None:
         return True
-    # Always allow help_text (but it's gated above)
-    if ctx.command and ctx.command.name in ("help_text", "balance_text"):
+    # allow help always
+    if ctx.command and ctx.command.name in ("help",):
         return True
     servers = load_json("servers")
     server_entry = servers.get(str(ctx.guild.id), {})
@@ -531,6 +1005,7 @@ async def global_command_block(ctx):
             await ctx.send(f"⚠️ The command `{cmd_name}` is currently disabled on this server.")
         except Exception:
             pass
+        print(f"[COMMAND BLOCKED] {ctx.guild.name}({ctx.guild.id}) blocked command: {cmd_name}")
         return False
     return True
 
@@ -539,13 +1014,23 @@ async def global_command_block(ctx):
 # -----------------------------
 @bot.event
 async def on_ready():
+    await tree.sync()  # register slash commands globally (or restrict later)
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
-    # sync slash commands
-    try:
-        await bot.tree.sync()
-        print("🔁 Slash commands synced.")
-    except Exception as e:
-        print("Warning: failed to sync commands:", e)
+    print("💾 JSON storage ready")
+    # ensure economy file entries exist for guilds bot is in
+    econ = load_json("economy")
+    updated = False
+    for g in bot.guilds:
+        if str(g.id) not in econ:
+            econ[str(g.id)] = {
+                "currency_name": "Coins",
+                "currency_symbol": "$",
+                "starting_balance": 0,
+                "tax_rate": 0
+            }
+            updated = True
+    if updated:
+        save_json("economy", econ)
 
 # -----------------------------
 # Run bot
