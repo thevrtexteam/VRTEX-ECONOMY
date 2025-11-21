@@ -657,11 +657,15 @@ DEFAULT_BUSINESSES = {
     # tier 3-5 may be unlocked by premium when implementing expansion
 }
 
-@tree.group(name="business", description="Business commands")
-async def business_group(interaction: discord.Interaction):
-    # grouped command placeholder
-    await interaction.response.send_message("Use subcommands: buy / list / claim / upgrade / info", ephemeral=True)
+# ✅ Create the group properly
+business_group = app_commands.Group(
+    name="business",
+    description="Business commands"
+)
 
+# -----------------------------
+# List businesses
+# -----------------------------
 @business_group.command(name="list", description="Show available businesses")
 async def business_list(interaction: discord.Interaction):
     embed = make_embed("🏠 Available Businesses", None, None)
@@ -669,23 +673,32 @@ async def business_list(interaction: discord.Interaction):
         embed.add_field(name=name, value=f"Cost: {info['cost']} | Profit: {info['profit']}", inline=False)
     await interaction.response.send_message(embed=embed)
 
+# -----------------------------
+# Buy a business
+# -----------------------------
 @business_group.command(name="buy", description="Buy a business")
 @app_commands.describe(name="Business name")
 async def business_buy(interaction: discord.Interaction, name: str):
     name = name.title()
     if name not in DEFAULT_BUSINESSES:
-        await interaction.response.send_message("❌ Business not found.", ephemeral=True); return
+        await interaction.response.send_message("❌ Business not found.", ephemeral=True)
+        return
     user = await get_user(interaction.user.id)
     if name in user.get("businesses", {}):
-        await interaction.response.send_message("❌ You already own this business.", ephemeral=True); return
+        await interaction.response.send_message("❌ You already own this business.", ephemeral=True)
+        return
     cost = DEFAULT_BUSINESSES[name]['cost']
     if user.get('wallet', 0) < cost:
-        await interaction.response.send_message("❌ Not enough money.", ephemeral=True); return
+        await interaction.response.send_message("❌ Not enough money.", ephemeral=True)
+        return
     user['wallet'] -= cost
     user.setdefault('businesses', {})[name] = DEFAULT_BUSINESSES[name].copy()
     await update_user(interaction.user.id, user)
     await interaction.response.send_message(f"✅ You bought **{name}**!")
 
+# -----------------------------
+# Claim profits
+# -----------------------------
 @business_group.command(name="claim", description="Claim profits from your businesses")
 async def business_claim(interaction: discord.Interaction):
     user = await get_user(interaction.user.id)
@@ -696,19 +709,25 @@ async def business_claim(interaction: discord.Interaction):
     await update_user(interaction.user.id, user)
     await interaction.response.send_message(f"✅ Claimed {total}{get_guild_economy(interaction.guild.id).get('currency_symbol','')} from your businesses.")
 
+# -----------------------------
+# Business info
+# -----------------------------
 @business_group.command(name="info", description="Get info on a business")
 @app_commands.describe(name="Business name")
 async def business_info(interaction: discord.Interaction, name: str):
     name = name.title()
     info = DEFAULT_BUSINESSES.get(name)
     if not info:
-        await interaction.response.send_message("❌ Business not found.", ephemeral=True); return
+        await interaction.response.send_message("❌ Business not found.", ephemeral=True)
+        return
     embed = make_embed(f"{name} Info", None, None)
     embed.add_field(name="Cost", value=str(info['cost']), inline=True)
     embed.add_field(name="Profit", value=str(info['profit']), inline=True)
     embed.add_field(name="Tier", value=str(info['tier']), inline=True)
     await interaction.response.send_message(embed=embed)
 
+# ✅ Register the group
+tree.add_command(business_group)
 # -----------------------------
 # Marketplace & inventory (simplified)
 # -----------------------------
@@ -1040,3 +1059,4 @@ if __name__ == "__main__":
         print("ERROR: DISCORD_TOKEN environment variable not set.")
     else:
         bot.run(TOKEN)
+
