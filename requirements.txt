@@ -1,5 +1,5 @@
 discord.py==2.4.0
 Flask
 python-dotenv
-pymongo[srv]==3.11
+pymongo[srv]>=4.0
 dnspython
