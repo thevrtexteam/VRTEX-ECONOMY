@@ -7,6 +7,7 @@ import os
 import asyncio
 import motor.motor_asyncio
 from datetime import datetime, timedelta
+from web_server import keep_alive  # <-- only here
 
 # -------------------- CONFIG --------------------
 TOKEN = os.getenv("DISCORD_TOKEN")  # Discord Bot Token
@@ -488,5 +489,7 @@ async def recap(interaction: Interaction):
 # -------------------- BOT RUN --------------------
 # Make sure your TOKEN is set in environment variables or directly
 
-TOKEN = os.getenv("DISCORD_TOKEN")  # Or replace with "YOUR_BOT_TOKEN" directly
+from web_server import keep_alive
+keep_alive()
 bot.run(TOKEN)
+
